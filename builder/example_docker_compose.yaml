@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  # Minimalist GoOrchestrator container (~13MB, FROM scratch, no ca-certs needed)
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: builder/Dockerfile
+    image: go-orchestrator:latest
+    container_name: go-orchestrator
+    networks:
+      - internal-mesh
+    ports:
+      # Expose locally for debugging; omit if routing purely via cloudflared
+      - "8080:8080"
+    command:
+      - "-port"
+      - "8080"
+      - "-mode"
+      - "http"
+      - "-lrm-url"
+      - "http://lrm-vllm:8000"       # Plain HTTP over internal network
+      - "-worker-url"
+      - "http://worker-vllm:8001"    # Plain HTTP over internal network
+    restart: unless-stopped
+    depends_on:
+      - lrm-vllm
+      - worker-vllm
+
+  # Cloudflare Tunnel: Securely connects orchestrator to your domain without open public ports
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-tunnel
+    networks:
+      - internal-mesh
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+
+  # Large Reasoning Model (LRM) - vLLM or local model server wearing all 4 hats
+  lrm-vllm:
+    image: vllm/vllm-openai:latest
+    container_name: lrm-vllm
+    networks:
+      - internal-mesh
+    command: ["--model", "Qwen/Qwen2.5-32B-Instruct", "--port", "8000"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Small Task Model (Worker) - fast tactical execution
+  worker-vllm:
+    image: vllm/vllm-openai:latest
+    container_name: worker-vllm
+    networks:
+      - internal-mesh
+    command: ["--model", "Qwen/Qwen2.5-Coder-7B-Instruct", "--port", "8001"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+networks:
+  internal-mesh:
+    driver: bridge
+

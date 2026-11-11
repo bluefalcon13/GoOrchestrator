@@ -1,0 +1,495 @@
+swagger: "2.0"
+info:
+  title: "Autonomous Agentic Orchestrator API"
+  version: "1.0.0"
+  description: >
+    Production REST and Conversational Intake API for the Go Orchestrator engine.
+    Cleanly separates high-level strategic reasoning (LRM Multi-Hat Engine)
+    from low-level task execution over a unified concurrent event loop.
+  contact:
+    name: "Orchestration Architecture Team"
+host: "localhost:8080"
+basePath: "/"
+schemes:
+  - "http"
+  - "https"
+consumes:
+  - "application/json"
+produces:
+  - "application/json"
+
+paths:
+  /api/v1/chat:
+    post:
+      summary: "Conversational Intake and Planning Assistant"
+      description: >
+        Backed by the LRM Conversational and Planner Hats. Interactively answers
+        questions regarding live system state, explains blockers, or drafts new
+        hierarchical DAG plans in response to directives.
+      parameters:
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            $ref: "#/definitions/ChatRequest"
+      responses:
+        200:
+          description: "Conversational response or newly generated draft plan."
+          schema:
+            $ref: "#/definitions/ChatResponse"
+        400:
+          description: "Invalid request payload."
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+        500:
+          description: "Internal processing or LLM failure."
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+
+  /api/v1/plans:
+    get:
+      summary: "List All Plans"
+      description: "Returns all tracked execution plans and their statuses."
+      responses:
+        200:
+          description: "List of execution plans."
+          schema:
+            type: "array"
+            items:
+              $ref: "#/definitions/PlanNode"
+        504:
+          description: "Gateway timeout querying actor event loop."
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+
+  /api/v1/plans/{planID}:
+    get:
+      summary: "Get Plan Real-Time Status"
+      description: >
+        Returns the hierarchical execution tree (Epics, Stories, Tasks) for a plan,
+        including attempt counters, outputs, artifacts, and pending clarification requests.
+      parameters:
+        - name: "planID"
+          in: "path"
+          required: true
+          type: "string"
+          description: "Unique plan identifier."
+      responses:
+        200:
+          description: "Real-time plan status snapshot."
+          schema:
+            $ref: "#/definitions/PlanNode"
+        404:
+          description: "Plan not found."
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+        504:
+          description: "Engine query error or timeout."
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+
+  /api/v1/plans/{planID}/approve:
+    post:
+      summary: "Approve Draft Plan or Inject Plan JSON"
+      description: >
+        Approves a draft plan or injects a raw JSON plan specification into active DAG execution.
+      parameters:
+        - name: "planID"
+          in: "path"
+          required: true
+          type: "string"
+          description: "Unique plan identifier."
+        - in: "body"
+          name: "body"
+          required: false
+          description: "Optional raw PlanSpec JSON. If omitted, approves previously drafted plan with this ID."
+          schema:
+            $ref: "#/definitions/PlanSpec"
+      responses:
+        200:
+          description: "Plan approved and scheduled for execution."
+          schema:
+            $ref: "#/definitions/CommandSuccessResponse"
+        400:
+          description: "Structural DAG validation failure or invalid plan JSON."
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+
+  /api/v1/plans/{planID}/tasks/{taskID}/clarify:
+    post:
+      summary: "Submit Clarification for Paused Task"
+      description: >
+        Submits user input answering a pending clarification question for a paused task.
+        Routes through the LRM Conversational Hat to amend task requirements and resume
+        the blocked DAG branch.
+      parameters:
+        - name: "planID"
+          in: "path"
+          required: true
+          type: "string"
+          description: "Plan ID containing the paused task."
+        - name: "taskID"
+          in: "path"
+          required: true
+          type: "string"
+          description: "ID of the task in AwaitingClarification state."
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            $ref: "#/definitions/ClarifyRequest"
+      responses:
+        200:
+          description: "Clarification accepted and task resumed."
+          schema:
+            $ref: "#/definitions/ClarifyResponse"
+        400:
+          description: "Task is not awaiting clarification or answer was empty."
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+        404:
+          description: "Plan or task not found."
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+
+  /openapi.yaml:
+    get:
+      summary: "OpenAPI 3.1 Specification"
+      description: "Returns the raw OpenAPI 3.1 specification in YAML format."
+      produces:
+        - "application/yaml"
+      responses:
+        200:
+          description: "OpenAPI 3.1 specification in YAML."
+          schema:
+            type: "string"
+
+  /healthz:
+    get:
+      summary: "Liveness & Health Check"
+      description: "Basic operational probe endpoint."
+      responses:
+        200:
+          description: "Service is healthy."
+          schema:
+            type: "object"
+            properties:
+              status:
+                type: "string"
+                example: "ok"
+
+definitions:
+  ErrorResponse:
+    type: "object"
+    required:
+      - "error"
+    properties:
+      error:
+        type: "string"
+        example: "plan 'plan-xyz' not found"
+
+  CommandSuccessResponse:
+    type: "object"
+    properties:
+      success:
+        type: "boolean"
+        example: true
+      plan_id:
+        type: "string"
+        example: "plan-1715000000"
+      message:
+        type: "string"
+        example: "plan accepted into execution"
+
+  ChatMessage:
+    type: "object"
+    properties:
+      role:
+        type: "string"
+        enum: ["system", "user", "assistant"]
+        example: "user"
+      content:
+        type: "string"
+        example: "Build an LRU cache in Go."
+
+  ChatRequest:
+    type: "object"
+    required:
+      - "message"
+    properties:
+      message:
+        type: "string"
+        example: "Build an in-memory token bucket rate limiter in Go."
+      plan_id:
+        type: "string"
+        description: "Optional ID of a specific plan to focus conversation context upon."
+        example: "plan-rate-limiter"
+      history:
+        type: "array"
+        items:
+          $ref: "#/definitions/ChatMessage"
+
+  ChatResponse:
+    type: "object"
+    properties:
+      reply:
+        type: "string"
+        example: "Understood. I have drafted a 3-task plan for your review."
+      intent:
+        type: "string"
+        enum: ["answer", "draft_plan"]
+        example: "draft_plan"
+      directive:
+        type: "string"
+        example: "Build an in-memory token bucket rate limiter in Go."
+      draft_plan:
+        $ref: "#/definitions/PlanSpec"
+
+  ClarifyRequest:
+    type: "object"
+    required:
+      - "answer"
+    properties:
+      answer:
+        type: "string"
+        example: "Use a sync.Mutex instead of atomic operations for bucket locking."
+
+  ClarifyResponse:
+    type: "object"
+    properties:
+      success:
+        type: "boolean"
+        example: true
+      message:
+        type: "string"
+        example: "Clarification accepted; task T1 resumed."
+      task:
+        $ref: "#/definitions/TaskNode"
+
+  TaskSpec:
+    type: "object"
+    required:
+      - "id"
+      - "title"
+      - "description"
+      - "task_type"
+    properties:
+      id:
+        type: "string"
+        example: "T1"
+      title:
+        type: "string"
+        example: "Define rate limiter domain types"
+      description:
+        type: "string"
+        example: "Synthesize Limiter struct and Allow/Take methods."
+      task_type:
+        type: "string"
+        example: "code_gen"
+      depends_on:
+        type: "array"
+        items:
+          type: "string"
+        example: []
+      acceptance_criteria:
+        type: "array"
+        items:
+          type: "string"
+        example:
+          - "Declares exported types and methods"
+          - "Compiles as valid Go without placeholders"
+      params:
+        type: "object"
+
+  StorySpec:
+    type: "object"
+    required:
+      - "id"
+      - "title"
+      - "tasks"
+    properties:
+      id:
+        type: "string"
+        example: "E1.S1"
+      title:
+        type: "string"
+        example: "Core Specification and Interfaces"
+      description:
+        type: "string"
+        example: "Domain model setup."
+      tasks:
+        type: "array"
+        items:
+          $ref: "#/definitions/TaskSpec"
+
+  EpicSpec:
+    type: "object"
+    required:
+      - "id"
+      - "title"
+      - "stories"
+    properties:
+      id:
+        type: "string"
+        example: "E1"
+      title:
+        type: "string"
+        example: "Domain Architecture"
+      description:
+        type: "string"
+        example: "Initial engineering epic."
+      stories:
+        type: "array"
+        items:
+          $ref: "#/definitions/StorySpec"
+
+  PlanSpec:
+    type: "object"
+    required:
+      - "title"
+      - "epics"
+    properties:
+      id:
+        type: "string"
+        example: "plan-rate-limiter"
+      title:
+        type: "string"
+        example: "Token Bucket Rate Limiter"
+      objective:
+        type: "string"
+        example: "Build an in-memory token bucket rate limiter in Go."
+      epics:
+        type: "array"
+        items:
+          $ref: "#/definitions/EpicSpec"
+
+  TaskNode:
+    type: "object"
+    properties:
+      id:
+        type: "string"
+        example: "T1"
+      title:
+        type: "string"
+        example: "Define limiter types"
+      description:
+        type: "string"
+      task_type:
+        type: "string"
+        example: "code_gen"
+      depends_on:
+        type: "array"
+        items:
+          type: "string"
+      acceptance_criteria:
+        type: "array"
+        items:
+          type: "string"
+      status:
+        type: "string"
+        enum:
+          - "Pending"
+          - "Ready"
+          - "Running"
+          - "Reviewing"
+          - "AwaitingClarification"
+          - "Completed"
+          - "Failed"
+          - "Blocked"
+        example: "Completed"
+      attempts:
+        type: "integer"
+        example: 1
+      max_attempts:
+        type: "integer"
+        example: 3
+      output:
+        type: "string"
+        example: "{\"files\":[{\"path\":\"limiter.go\",\"content\":\"package limiter...\"}]}"
+      artifacts:
+        type: "object"
+        additionalProperties:
+          type: "string"
+      feedback_history:
+        type: "array"
+        items:
+          type: "string"
+      clarifications:
+        type: "array"
+        items:
+          type: "string"
+      pending_explanation:
+        type: "string"
+      pending_question:
+        type: "string"
+      last_error:
+        type: "string"
+      last_score:
+        type: "number"
+        example: 0.92
+
+  StoryNode:
+    type: "object"
+    properties:
+      id:
+        type: "string"
+        example: "E1.S1"
+      title:
+        type: "string"
+      status:
+        type: "string"
+        example: "Completed"
+      tasks:
+        type: "array"
+        items:
+          $ref: "#/definitions/TaskNode"
+
+  EpicNode:
+    type: "object"
+    properties:
+      id:
+        type: "string"
+        example: "E1"
+      title:
+        type: "string"
+      status:
+        type: "string"
+        example: "Completed"
+      stories:
+        type: "array"
+        items:
+          $ref: "#/definitions/StoryNode"
+
+  PlanNode:
+    type: "object"
+    properties:
+      id:
+        type: "string"
+        example: "plan-rate-limiter"
+      title:
+        type: "string"
+      objective:
+        type: "string"
+      status:
+        type: "string"
+        enum:
+          - "Draft"
+          - "Pending"
+          - "Ready"
+          - "Running"
+          - "AwaitingClarification"
+          - "Completed"
+          - "Failed"
+          - "Blocked"
+        example: "Completed"
+      epics:
+        type: "array"
+        items:
+          $ref: "#/definitions/EpicNode"
+      created_at:
+        type: "string"
+        format: "date-time"
+      updated_at:
+        type: "string"
+        format: "date-time"
+

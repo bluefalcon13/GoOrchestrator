@@ -1,0 +1,80 @@
+{
+  "id": "blueprint-rate-limiter",
+  "title": "Token Bucket Rate Limiter",
+  "objective": "Build a production-grade in-memory token bucket rate limiter in Go with table-driven tests and release notes.",
+  "epics": [
+    {
+      "id": "E1",
+      "title": "Requirements & Domain Modeling",
+      "description": "Establish requirements and Go interface contracts.",
+      "stories": [
+        {
+          "id": "E1.S1",
+          "title": "Specification and Type Definitions",
+          "tasks": [
+            {
+              "id": "T1",
+              "title": "Extract rate limiter requirements",
+              "description": "Extract rate limit parameters, bursts, replenishment rates, and safety constraints.",
+              "task_type": "text_extract",
+              "params": {
+                "fields": ["goals", "constraints", "deliverables", "risks"],
+                "document": "Goal: thread-safe token bucket rate limiter. Burst capacity: 100 tokens. Refill rate: 10 tokens/sec. Constraints: zero external dependencies, thread-safe, return errors on empty inputs."
+              },
+              "acceptance_criteria": [
+                "Extracts burst and refill parameters",
+                "Cites source text constraints"
+              ]
+            },
+            {
+              "id": "T2",
+              "title": "Define limiter domain types and interfaces",
+              "description": "Synthesize Go types including Limiter struct and Allow/Take methods.",
+              "task_type": "code_gen",
+              "depends_on": ["T1"],
+              "params": {
+                "language": "go",
+                "filename": "limiter.go",
+                "package": "limiter"
+              },
+              "acceptance_criteria": [
+                "Declares exported types and methods",
+                "Compiles as valid Go without placeholders"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "E2",
+      "title": "Testing & Verification",
+      "description": "Unit tests and operational documentation.",
+      "stories": [
+        {
+          "id": "E2.S1",
+          "title": "Verification Suite",
+          "tasks": [
+            {
+              "id": "T3",
+              "title": "Synthesize unit tests",
+              "description": "Table-driven tests covering burst limits, refill rates, and concurrency safety.",
+              "task_type": "code_gen",
+              "depends_on": ["T2"],
+              "params": {
+                "language": "go",
+                "filename": "limiter_test.go",
+                "package": "limiter"
+              },
+              "acceptance_criteria": [
+                "Uses standard testing package",
+                "Covers edge cases"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
