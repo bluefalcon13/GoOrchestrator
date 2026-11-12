@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -397,9 +398,19 @@ func (s *MCPServer) handleToolCall(req jsonRPCRequest) *jsonRPCResponse {
 		if limit <= 0 {
 			limit = 5
 		}
-		results, err := s.oCtx.RAGClient.SearchAndRerank(nil, col, in.Query, limit*2, limit)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		results, err := s.oCtx.RAGClient.SearchAndRerank(ctx, col, in.Query, limit*2, limit)
+		cancel()
 		if err != nil {
-			outputText = fmt.Sprintf("Search error: %v", err)
+			if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "doesn't exist") {
+				outputText = fmt.Sprintf("Collection %q not found or empty. You can ingest files using strix_orchestrator_ingest_file(collection=%q, content=...).", col, col)
+			} else {
+				outputText = fmt.Sprintf("Search error: %v", err)
+			}
+			break
+		}
+		if len(results) == 0 {
+			outputText = fmt.Sprintf("No relevant matches found in collection %q for query %q.", col, in.Query)
 			break
 		}
 		var sb strings.Builder
@@ -436,7 +447,9 @@ func (s *MCPServer) handleToolCall(req jsonRPCRequest) *jsonRPCResponse {
 		if cs <= 0 {
 			cs = 512
 		}
-		numChunks, err := s.oCtx.RAGClient.IndexText(nil, col, in.Content, src, cs)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		numChunks, err := s.oCtx.RAGClient.IndexText(ctx, col, in.Content, src, cs)
+		cancel()
 		if err != nil {
 			outputText = fmt.Sprintf("Ingest error: %v", err)
 			break
