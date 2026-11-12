@@ -258,10 +258,16 @@ func ParsePlanSpec(raw string) (PlanSpec, error) {
 		for j := range spec.Epics[i].Stories {
 			for k := range spec.Epics[i].Stories[j].Tasks {
 				t := &spec.Epics[i].Stories[j].Tasks[k]
-				if t.TaskType == "" || t.TaskType == "code" || t.TaskType == "code_generation" {
+				tt := strings.ToLower(strings.TrimSpace(t.TaskType))
+				switch tt {
+				case "", "code", "coding", "code_generation", "codegen":
 					t.TaskType = "code_gen"
-				} else if t.TaskType == "extract" || t.TaskType == "text" {
+				case "extract", "text", "text_extraction", "report", "markdown":
 					t.TaskType = "text_extract"
+				case "rag_query", "rag", "query", "search", "rag-query", "rag-search":
+					t.TaskType = "rag_search"
+				case "ingest", "index", "rag_ingest", "rag-index", "indexing":
+					t.TaskType = "rag_index"
 				}
 			}
 		}

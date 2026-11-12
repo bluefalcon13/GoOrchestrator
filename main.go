@@ -62,10 +62,32 @@ func main() {
 
 	// 4. Task Registry & Execution Engine (Kahn DAG Scheduler)
 	registry := tasks.NewRegistry()
-	registry.Register("code_gen", tasks.NewCodeGenHandler(workerRouter))
-	registry.Register("text_extract", tasks.NewTextExtractHandler(workerRouter, ragClient))
-	registry.Register("rag_index", tasks.NewRAGIndexHandler(ragClient))
-	registry.Register("rag_search", tasks.NewRAGSearchHandler(ragClient))
+	codeGenH := tasks.NewCodeGenHandler(workerRouter)
+	textExtractH := tasks.NewTextExtractHandler(workerRouter, ragClient)
+	ragIndexH := tasks.NewRAGIndexHandler(ragClient)
+	ragSearchH := tasks.NewRAGSearchHandler(ragClient)
+
+	// Core handlers
+	registry.Register("code_gen", codeGenH)
+	registry.Register("code", codeGenH)
+	registry.Register("codegen", codeGenH)
+	registry.Register("code_generation", codeGenH)
+
+	registry.Register("text_extract", textExtractH)
+	registry.Register("extract", textExtractH)
+	registry.Register("text", textExtractH)
+	registry.Register("report", textExtractH)
+
+	registry.Register("rag_index", ragIndexH)
+	registry.Register("ingest", ragIndexH)
+	registry.Register("index", ragIndexH)
+	registry.Register("rag_ingest", ragIndexH)
+
+	registry.Register("rag_search", ragSearchH)
+	registry.Register("rag_query", ragSearchH)
+	registry.Register("rag", ragSearchH)
+	registry.Register("query", ragSearchH)
+	registry.Register("search", ragSearchH)
 
 	lrmClient := llm.NewClient(*lrmURL, llm.WithMode(llm.ModeHTTP))
 	lrm := llm.NewLRMPersonaEngine(lrmClient)
