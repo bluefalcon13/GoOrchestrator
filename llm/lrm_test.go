@@ -97,3 +97,86 @@ func TestLRMPersonaEngine_MockFlow(t *testing.T) {
 	}
 }
 
+func TestParsePlanSpec_LeGarbage(t *testing.T) {
+	raw := `{
+    "title": "Star Citizen Ghost State Investigation",
+    "objective": "Perform a forensic investigation of a 1.5M line log file to identify the causal link between server-side instability, orphaned mission states, and the 'Ghost State' account corruption.",
+    "epics": [
+        {
+            "title": "Signal Extraction",
+            "objective": "Extract high-density forensic markers from the raw log data.",
+            "stories": [
+                {
+                    "title": "Error and Mission Signatures",
+                    "tasks": [
+                        {
+                            "name": "T1: Error Signatures",
+                            "description": "Parse log for [Error] and [Critical] tags, focusing on Subsumption, DGS, and Mission services. Output to errors.json"
+                        },
+                        {
+                            "name": "T2: Mission Lifecycle",
+                            "description": "Extract <EndMission>, <MissionEnded>, and MISSION_OBJECTIVE_STATE transitions. Output to mission_lifecycle.json"
+                        }
+                    ]
+                },
+                {
+                    "title": "Account and Stability Signatures",
+                    "tasks": [
+                        {
+                            "name": "T3: ObjectDataBank Errors",
+                            "description": "Surgical extraction of 'Missing Player ObjectDataBank' errors. Output to object_data_bank_errors.json"
+                        },
+                        {
+                            "name": "T4: Server Instability",
+                            "description": "Parse for <ServerCrashRecovery> and <ReplicationLayer> heartbeat losses. Output to server_instability.json"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Correlation and Synthesis",
+            "objective": "Analyze temporal relationships between extracted signals.",
+            "stories": [
+                {
+                    "title": "Forensic Analysis",
+                    "tasks": [
+                        {
+                            "name": "T5: Correlation Engine",
+                            "description": "Python script to perform millisecond-accurate temporal join of T1, T2, T3, and T4. Output: correlation_results.json",
+                            "depends_on": [
+                                "T1",
+                                "T2",
+                                "T3",
+                                "T4"
+                            ]
+                        },
+                        {
+                            "name": "T6: Final Forensic Report",
+                            "description": "Generate a Markdown report detailing the causal chain of the desync."
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}`
+	spec, err := ParsePlanSpec(raw)
+	if err != nil {
+		t.Fatalf("ParsePlanSpec failed: %v", err)
+	}
+	if spec.TaskCount() != 6 {
+		t.Fatalf("expected 6 tasks, got %d", spec.TaskCount())
+	}
+	if spec.Epics[0].Stories[0].Tasks[0].ID != "T1" {
+		t.Errorf("expected task ID 'T1', got %q", spec.Epics[0].Stories[0].Tasks[0].ID)
+	}
+	if spec.Epics[1].Stories[0].Tasks[0].ID != "T5" {
+		t.Errorf("expected task ID 'T5', got %q", spec.Epics[1].Stories[0].Tasks[0].ID)
+	}
+	if spec.Epics[0].ID == "" || spec.Epics[0].Stories[0].ID == "" {
+		t.Errorf("expected auto-generated IDs for epics and stories, got Epic=%q Story=%q",
+			spec.Epics[0].ID, spec.Epics[0].Stories[0].ID)
+	}
+}
+

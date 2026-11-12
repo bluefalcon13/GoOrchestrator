@@ -1,6 +1,7 @@
 # Binaries and build output
 /build/
 build/
+go-orchestrator
 *.exe
 *.exe~
 *.dll

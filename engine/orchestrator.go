@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -96,12 +98,25 @@ func (o *Orchestrator) RunEventLoop(ctx context.Context, srvShutdown func(contex
 
 			case GetPlanQuery:
 				plan, exists := o.plans[ev.PlanID]
+				if !exists {
+					if draft, ok := o.draftPlans[ev.PlanID]; ok {
+						draftNode := o.createPlanNode(draft)
+						draftNode.Status = PlanStatusDraft
+						plan = draftNode
+						exists = true
+					}
+				}
 				ev.ReplyCh <- GetPlanResult{Plan: clonePlan(plan), Found: exists}
 
 			case ListPlansQuery:
-				list := make([]*PlanNode, 0, len(o.plans))
+				list := make([]*PlanNode, 0, len(o.plans)+len(o.draftPlans))
 				for _, p := range o.plans {
 					list = append(list, clonePlan(p))
+				}
+				for _, d := range o.draftPlans {
+					draftNode := o.createPlanNode(d)
+					draftNode.Status = PlanStatusDraft
+					list = append(list, draftNode)
 				}
 				sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
 				ev.ReplyCh <- list
@@ -109,8 +124,21 @@ func (o *Orchestrator) RunEventLoop(ctx context.Context, srvShutdown func(contex
 			case GetSystemStateQuery:
 				ev.ReplyCh <- o.formatSystemStateSummary()
 
+			case GetDraftPlansQuery:
+				drafts := make([]llm.PlanSpec, 0, len(o.draftPlans))
+				for _, d := range o.draftPlans {
+					drafts = append(drafts, d)
+				}
+				ev.ReplyCh <- drafts
+
 			case StoreDraftPlanCommand:
 				o.handleStoreDraftPlan(ev)
+
+			case PausePlanCommand:
+				o.handlePausePlan(ev)
+
+			case ResumePlanCommand:
+				o.handleResumePlan(ctx, ev)
 
 			default:
 				o.log.Warn("unhandled event type", "type", fmt.Sprintf("%T", event))
@@ -160,11 +188,58 @@ func (o *Orchestrator) shutdown(cancelWorkers context.CancelFunc, srvShutdown fu
 // ---------------------------------------------------------------------------
 
 func (o *Orchestrator) handleSeedPlan(ctx context.Context, ev SeedPlanEvent) {
-	spec, err := llm.ParsePlanSpec(ev.RawJSON)
-	if err != nil {
-		o.log.Error("failed to parse plan JSON", "err", err)
+	var spec llm.PlanSpec
+	var err error
+
+	if strings.TrimSpace(ev.RawJSON) != "" {
+		spec, err = llm.ParsePlanSpec(ev.RawJSON)
+		if err != nil {
+			o.log.Error("failed to parse plan JSON", "err", err)
+			if ev.ReplyCh != nil {
+				ev.ReplyCh <- CommandResult{Success: false, Message: "failed to parse plan JSON", Err: err}
+			}
+			return
+		}
+	} else if ev.PlanID != "" {
+		draft, ok := o.draftPlans[ev.PlanID]
+		if !ok {
+			// Fuzzy auto-healing: prefix/substring match or single draft fallback
+			for dID, d := range o.draftPlans {
+				if strings.HasPrefix(dID, ev.PlanID) || strings.HasPrefix(ev.PlanID, dID) || strings.Contains(dID, ev.PlanID) {
+					draft = d
+					ok = true
+					ev.PlanID = dID
+					break
+				}
+			}
+			if !ok && len(o.draftPlans) == 1 {
+				for dID, d := range o.draftPlans {
+					draft = d
+					ok = true
+					ev.PlanID = dID
+					break
+				}
+			}
+		}
+		if !ok {
+			o.log.Error("draft plan not found in registry", "plan_id", ev.PlanID)
+			if ev.ReplyCh != nil {
+				ev.ReplyCh <- CommandResult{Success: false, Message: fmt.Sprintf("draft plan %q not found", ev.PlanID), Err: fmt.Errorf("draft plan not found")}
+			}
+			return
+		}
+		spec = draft
+	} else if len(o.draftPlans) == 1 {
+		// PlanID was omitted, auto-resolve single pending draft
+		for dID, d := range o.draftPlans {
+			spec = d
+			ev.PlanID = dID
+			break
+		}
+	} else {
+		o.log.Error("seed plan requires either RawJSON or PlanID")
 		if ev.ReplyCh != nil {
-			ev.ReplyCh <- CommandResult{Success: false, Message: "failed to parse plan JSON", Err: err}
+			ev.ReplyCh <- CommandResult{Success: false, Message: "missing plan specification", Err: fmt.Errorf("neither RawJSON nor PlanID provided")}
 		}
 		return
 	}
@@ -173,7 +248,7 @@ func (o *Orchestrator) handleSeedPlan(ctx context.Context, ev SeedPlanEvent) {
 		spec.ID = ev.PlanID
 	}
 	if spec.ID == "" {
-		spec.ID = fmt.Sprintf("plan-%d", time.Now().UnixMilli())
+		spec.ID = GeneratePlanSlug(spec.Title)
 	}
 
 	// Run Go-side structural DAG validation
@@ -199,13 +274,104 @@ func (o *Orchestrator) handleSeedPlan(ctx context.Context, ev SeedPlanEvent) {
 	o.evaluateAndDispatch(ctx, planNode)
 }
 
+// GeneratePlanSlug creates a normalized plan ID slug from its title.
+func GeneratePlanSlug(title string) string {
+	clean := strings.ToLower(title)
+	for _, word := range []string{"forensic", "analysis", "plan:", "investigation", "root cause", "pipeline", "specialized"} {
+		clean = strings.ReplaceAll(clean, word, "")
+	}
+
+	var sb strings.Builder
+	sb.WriteString("plan-")
+	lastDash := true
+	count := 0
+	for _, r := range clean {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+			lastDash = false
+			count++
+			if count >= 30 {
+				break
+			}
+		} else if !lastDash {
+			sb.WriteRune('-')
+			lastDash = true
+		}
+	}
+	res := strings.Trim(sb.String(), "-")
+	if res == "plan" || res == "" {
+		res = "plan-workflow"
+	}
+
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", title, time.Now().UnixNano())))
+	suffix := hex.EncodeToString(hash[:2]) // 4 hex chars
+	return fmt.Sprintf("%s-%s", res, suffix)
+}
+
 func (o *Orchestrator) handleStoreDraftPlan(ev StoreDraftPlanCommand) {
 	spec := ev.Plan
 	if spec.ID == "" {
-		spec.ID = fmt.Sprintf("draft-%d", time.Now().UnixMilli())
+		spec.ID = GeneratePlanSlug(spec.Title)
 	}
 	o.draftPlans[spec.ID] = spec
 	ev.ReplyCh <- CommandResult{Success: true, Message: "draft plan saved", Data: spec}
+}
+
+func (o *Orchestrator) handlePausePlan(ev PausePlanCommand) {
+	var target *PlanNode
+	if ev.PlanID != "" {
+		target = o.plans[ev.PlanID]
+	} else {
+		for _, p := range o.plans {
+			if p.Status == PlanStatusRunning || p.Status == PlanStatusReady {
+				target = p
+				break
+			}
+		}
+	}
+
+	if target == nil {
+		if ev.ReplyCh != nil {
+			ev.ReplyCh <- CommandResult{Success: false, Message: "no active plan found to pause", Err: fmt.Errorf("plan not found")}
+		}
+		return
+	}
+
+	target.Status = PlanStatusPaused
+	target.UpdatedAt = time.Now()
+	o.log.Info("plan execution paused", "plan_id", target.ID)
+	if ev.ReplyCh != nil {
+		ev.ReplyCh <- CommandResult{Success: true, Message: fmt.Sprintf("plan %s paused", target.ID), Data: target.ID}
+	}
+}
+
+func (o *Orchestrator) handleResumePlan(ctx context.Context, ev ResumePlanCommand) {
+	var target *PlanNode
+	if ev.PlanID != "" {
+		target = o.plans[ev.PlanID]
+	} else {
+		for _, p := range o.plans {
+			if p.Status == PlanStatusPaused {
+				target = p
+				break
+			}
+		}
+	}
+
+	if target == nil {
+		if ev.ReplyCh != nil {
+			ev.ReplyCh <- CommandResult{Success: false, Message: "no paused plan found to resume", Err: fmt.Errorf("plan not found")}
+		}
+		return
+	}
+
+	target.Status = PlanStatusRunning
+	target.UpdatedAt = time.Now()
+	o.log.Info("plan execution resumed", "plan_id", target.ID)
+	if ev.ReplyCh != nil {
+		ev.ReplyCh <- CommandResult{Success: true, Message: fmt.Sprintf("plan %s resumed", target.ID), Data: target.ID}
+	}
+	o.evaluateAndDispatch(ctx, target)
 }
 
 func (o *Orchestrator) createPlanNode(spec llm.PlanSpec) *PlanNode {
@@ -262,6 +428,11 @@ func (o *Orchestrator) createPlanNode(spec llm.PlanSpec) *PlanNode {
 // ---------------------------------------------------------------------------
 
 func (o *Orchestrator) evaluateAndDispatch(ctx context.Context, plan *PlanNode) {
+	if plan.Status == PlanStatusPaused {
+		o.log.Info("plan is paused, skipping task dispatch", "plan_id", plan.ID)
+		return
+	}
+
 	allTasks := o.flattenTasks(plan)
 	taskMap := make(map[string]*TaskNode, len(allTasks))
 	for _, t := range allTasks {
@@ -769,6 +940,11 @@ func (o *Orchestrator) blockTransitiveDependents(plan *PlanNode, rootTaskID stri
 // ---------------------------------------------------------------------------
 
 func (o *Orchestrator) rollupPlan(plan *PlanNode) {
+	if plan.Status == PlanStatusPaused {
+		plan.UpdatedAt = time.Now()
+		return
+	}
+
 	for _, epic := range plan.Epics {
 		for _, story := range epic.Stories {
 			story.Status = computeAggregateStatus(storyTasksToStatuses(story.Tasks))

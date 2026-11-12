@@ -143,7 +143,7 @@ func NewClient(baseURL string, opts ...ClientOption) LLMClient {
 	cfg := clientConfig{
 		mode:        ModeMock,
 		model:       "default",
-		timeout:     120 * time.Second,
+		timeout:     300 * time.Second,
 		maxRetries:  3,
 		mockLatency: 150 * time.Millisecond,
 		logger:      slog.Default(),

@@ -62,7 +62,9 @@ func NewLRMPersonaEngine(client LLMClient, opts ...LRMOption) *LRMPersonaEngine 
 }
 
 // Persona returns the active profile for a hat.
-func (e *LRMPersonaEngine) Persona(h Hat) Persona { return e.personas[h] }
+func (e *LRMPersonaEngine) Persona(h Hat) Persona {
+	return e.personas[h]
+}
 
 type hatCall struct {
 	hat      Hat
@@ -76,10 +78,7 @@ type hatCall struct {
 // wear executes one structured call under a given hat.
 func wear[T any](ctx context.Context, e *LRMPersonaEngine, call hatCall, validate func(*T) error) (T, error) {
 	var zero T
-	persona, ok := e.personas[call.hat]
-	if !ok {
-		return zero, fmt.Errorf("no persona registered for hat %q", call.hat)
-	}
+	persona := e.Persona(call.hat)
 	msgs := make([]Message, 0, len(call.history)+2)
 	msgs = append(msgs, Message{Role: RoleSystem, Content: persona.systemMessage(call.contract)})
 	msgs = append(msgs, call.history...)

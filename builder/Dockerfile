@@ -1,7 +1,7 @@
 # ------------------------------------------------------------------------------
 # Stage 1: Build static executable
 # ------------------------------------------------------------------------------
-FROM golang:1.22-alpine AS builder
+FROM golang:alpine AS builder
 
 WORKDIR /src
 
@@ -9,8 +9,7 @@ WORKDIR /src
 RUN echo "orchestrator:x:10001:10001:GoOrchestrator User:/nonexistent:/bin/false" > /etc/passwd.scratch
 
 # Cache dependencies
-COPY go.mod ./
-# COPY go.sum ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy source tree
@@ -21,7 +20,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -trimpath \
     -ldflags="-s -w -extldflags '-static'" \
     -o /bin/orchestrator \
-    ./main.go
+    .
 
 # ------------------------------------------------------------------------------
 # Stage 2: Pure Minimalist Scratch Runtime (~13MB total)

@@ -46,11 +46,126 @@ type PlanSpec struct {
 	Epics     []EpicSpec `json:"epics"`
 }
 
-// ParsePlanSpec decodes a plan document, tolerating surrounding prose/fences.
+// ParsePlanSpec decodes a plan document, tolerating surrounding prose/fences,
+// wrapper objects (e.g. {"plan": {...}}), and direct tasks under epics.
 func ParsePlanSpec(raw string) (PlanSpec, error) {
-	spec, err := DecodeJSON[PlanSpec](raw)
+	cleanJSON, err := ExtractJSON(raw)
 	if err != nil {
 		return PlanSpec{}, fmt.Errorf("malformed plan JSON: %w", err)
+	}
+
+	var rawMap map[string]any
+	if err := json.Unmarshal([]byte(cleanJSON), &rawMap); err == nil {
+		// Unwrap {"plan": ...}, {"plan_spec": ...}, {"spec": ...}, etc.
+		for _, wrapper := range []string{"plan", "plan_spec", "spec", "workflow", "data"} {
+			if sub, ok := rawMap[wrapper].(map[string]any); ok {
+				rawMap = sub
+				break
+			}
+		}
+		// Normalize title
+		if _, hasTitle := rawMap["title"]; !hasTitle {
+			if name, ok := rawMap["name"].(string); ok {
+				rawMap["title"] = name
+			} else if planName, ok := rawMap["plan_name"].(string); ok {
+				rawMap["title"] = planName
+			}
+		}
+		// Normalize epics, stories, and tasks
+		taskSeq := 1
+		if epicsRaw, ok := rawMap["epics"].([]any); ok {
+			for i, eRaw := range epicsRaw {
+				if eMap, ok := eRaw.(map[string]any); ok {
+					if _, hasID := eMap["id"]; !hasID {
+						eMap["id"] = fmt.Sprintf("E%d", i+1)
+					}
+					stories, _ := eMap["stories"].([]any)
+					tasks, hasTasks := eMap["tasks"].([]any)
+					if len(stories) == 0 && hasTasks && len(tasks) > 0 {
+						eMap["stories"] = []any{
+							map[string]any{
+								"id":    fmt.Sprintf("E%d.S1", i+1),
+								"title": fmt.Sprintf("%v Story", eMap["title"]),
+								"tasks": tasks,
+							},
+						}
+						stories, _ = eMap["stories"].([]any)
+					}
+
+					for j, sRaw := range stories {
+						if sMap, ok := sRaw.(map[string]any); ok {
+							if _, hasID := sMap["id"]; !hasID {
+								sMap["id"] = fmt.Sprintf("E%d.S%d", i+1, j+1)
+							}
+							if sTasks, ok := sMap["tasks"].([]any); ok {
+								for _, tRaw := range sTasks {
+									if tMap, ok := tRaw.(map[string]any); ok {
+										// Normalize name -> id & title
+										nameStr, _ := tMap["name"].(string)
+										titleStr, _ := tMap["title"].(string)
+										if titleStr == "" && nameStr != "" {
+											tMap["title"] = nameStr
+										}
+										idStr, _ := tMap["id"].(string)
+										if idStr == "" {
+											candidate := nameStr
+											if candidate == "" {
+												candidate = titleStr
+											}
+											// If candidate starts with "T1:", "T2 -", etc.
+											if strings.Contains(candidate, ":") {
+												candidate = strings.TrimSpace(strings.Split(candidate, ":")[0])
+											} else if strings.Contains(candidate, "-") {
+												candidate = strings.TrimSpace(strings.Split(candidate, "-")[0])
+											} else if candidate == "" {
+												candidate = fmt.Sprintf("T%d", taskSeq)
+											}
+											tMap["id"] = candidate
+										}
+										taskSeq++
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		} else if tasksRaw, ok := rawMap["tasks"].([]any); ok && len(tasksRaw) > 0 {
+			rawMap["epics"] = []any{
+				map[string]any{
+					"id":    "epic-1",
+					"title": rawMap["title"],
+					"stories": []any{
+						map[string]any{
+							"id":    "story-1",
+							"title": rawMap["title"],
+							"tasks": tasksRaw,
+						},
+					},
+				},
+			}
+		}
+		reBytes, _ := json.Marshal(rawMap)
+		cleanJSON = string(reBytes)
+	}
+
+	spec, err := DecodeJSON[PlanSpec](cleanJSON)
+	if err != nil {
+		return PlanSpec{}, fmt.Errorf("malformed plan JSON: %w", err)
+	}
+
+	// Normalize task types if missing or approximate
+	for i := range spec.Epics {
+		for j := range spec.Epics[i].Stories {
+			for k := range spec.Epics[i].Stories[j].Tasks {
+				t := &spec.Epics[i].Stories[j].Tasks[k]
+				if t.TaskType == "" || t.TaskType == "code" || t.TaskType == "code_generation" {
+					t.TaskType = "code_gen"
+				} else if t.TaskType == "extract" || t.TaskType == "text" {
+					t.TaskType = "text_extract"
+				}
+			}
+		}
 	}
 	return spec, nil
 }

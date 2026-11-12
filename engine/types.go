@@ -35,6 +35,7 @@ const (
 	PlanStatusCompleted             PlanStatus = "Completed"
 	PlanStatusFailed                PlanStatus = "Failed"
 	PlanStatusBlocked               PlanStatus = "Blocked"
+	PlanStatusPaused                PlanStatus = "Paused"
 )
 
 // TaskNode is the in-memory representation of a leaf task during execution.
@@ -190,9 +191,26 @@ type GetSystemStateQuery struct {
 	ReplyCh chan string
 }
 
+// GetDraftPlansQuery queries all draft plans currently in memory.
+type GetDraftPlansQuery struct {
+	ReplyCh chan []llm.PlanSpec
+}
+
 // StoreDraftPlanCommand saves an unapproved draft plan produced by the conversational/planner hats.
 type StoreDraftPlanCommand struct {
 	Plan    llm.PlanSpec
+	ReplyCh chan CommandResult
+}
+
+// PausePlanCommand requests pausing active execution of a plan.
+type PausePlanCommand struct {
+	PlanID  string
+	ReplyCh chan CommandResult
+}
+
+// ResumePlanCommand requests resuming execution of a paused plan.
+type ResumePlanCommand struct {
+	PlanID  string
 	ReplyCh chan CommandResult
 }
 

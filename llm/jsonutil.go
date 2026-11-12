@@ -84,7 +84,6 @@ func DecodeJSON[T any](s string) (T, error) {
 func mustJSON(v any) string {
 	b, err := json.Marshal(v)
 	if err != nil {
-		// Only reachable for unsupported types, which would be a programming error.
 		panic(err)
 	}
 	return string(b)

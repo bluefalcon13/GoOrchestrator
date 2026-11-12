@@ -2,82 +2,154 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"go-orchestrator/api"
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/model/openaimodel"
+	"google.golang.org/adk/v2/server/adkrest"
+	"google.golang.org/adk/v2/session"
+
+	orchagent "go-orchestrator/agent"
 	"go-orchestrator/engine"
 	"go-orchestrator/llm"
+	"go-orchestrator/rag"
 	"go-orchestrator/tasks"
 )
 
 func main() {
-	port := flag.Int("port", 8080, "HTTP server port for the conversational API")
-	blueprintPath := flag.String("blueprint", "", "Path to optional initial bootstrap blueprint JSON file")
-	llmMode := flag.String("mode", "mock", "LLM backend mode: 'mock' (offline deterministic) or 'http' (remote /v1/chat/completions)")
-	lrmURL := flag.String("lrm-url", "http://localhost:8000", "Base URL for Large Reasoning Model backend")
-	workerURL := flag.String("worker-url", "http://localhost:8001", "Base URL for Small Task Model backend")
+	port := flag.String("port", "8080", "HTTP server port")
+	lrmURL := flag.String("lrm-url", "http://localhost:8000", "Base URL for Large Reasoning Model (vLLM Gemma 4 26B)")
+	workerURL := flag.String("worker-url", "http://localhost:8001", "Base URL for Leaf Worker (NPU Qwen 7B)")
+	embedURL := flag.String("embed-url", "http://llama-embed:8080", "Base URL for Llama.cpp Embedding backend")
+	rerankURL := flag.String("rerank-url", "http://llama-rerank:8080", "Base URL for Llama.cpp Reranker backend")
+	qdrantURL := flag.String("qdrant-url", "http://qdrant:6333", "Base URL for Qdrant Vector Database")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	parsedMode, err := llm.ParseMode(*llmMode)
+	log.Printf("[ADK Orchestrator] Initializing local AI stack on port %s...", *port)
+
+	// 1. Model Backend via ADK OpenAI Connector (Points to vLLM on :8000)
+	lrmModel, err := openaimodel.NewModel(ctx, "default", &openaimodel.ClientConfig{
+		BaseURL: *lrmURL + "/v1",
+		API:     openaimodel.APIChatCompletions,
+	})
 	if err != nil {
-		log.Fatalf("[Main] Invalid LLM mode: %v", err)
+		log.Fatalf("Failed to initialize ADK LRM model: %v", err)
 	}
 
-	// Initialize the TWO underlying LLM backends via a unified interface:
-	// 1. Large Reasoning Model (LRM) - one model wearing multiple "hats" (system prompts/personas)
-	// 2. Small Task Model (Worker) - fast tactical execution model
-	lrmClient := llm.NewClient(*lrmURL, llm.WithMode(parsedMode))
-	workerClient := llm.NewClient(*workerURL, llm.WithMode(parsedMode))
+	// 2. Worker Router (Local XDNA 2 NPU + Dynamic Remote Workers)
+	workerRouter := engine.NewWorkerRouter(llm.ModeHTTP, engine.WorkerNode{
+		ID:          "npu-local",
+		Name:        "AMD XDNA 2 NPU (Ryzen AI)",
+		URL:         *workerURL,
+		Type:        "npu",
+		MaxContext:  8192,
+		Concurrency: 1,
+		Tags:        []string{"npu", "local", "fast"},
+	})
 
-	// Wrap the single LRM client with multi-hat persona capabilities
-	// (Conversational, Planner, ProjectManager, Reviewer)
+	// 3. RAG Client (Zen 5 CPU Cluster)
+	ragClient := rag.NewHTTPRAGClient(*embedURL, *rerankURL, *qdrantURL)
+
+	// 4. Task Registry & Execution Engine (Kahn DAG Scheduler)
+	registry := tasks.NewRegistry()
+	registry.Register("code_gen", tasks.NewCodeGenHandler(workerRouter))
+	registry.Register("text_extract", tasks.NewTextExtractHandler(workerRouter, ragClient))
+	registry.Register("rag_index", tasks.NewRAGIndexHandler(ragClient))
+	registry.Register("rag_search", tasks.NewRAGSearchHandler(ragClient))
+
+	lrmClient := llm.NewClient(*lrmURL, llm.WithMode(llm.ModeHTTP))
 	lrm := llm.NewLRMPersonaEngine(lrmClient)
 
-	// Register domain-agnostic task handlers powered by the Small Worker Model
-	registry := tasks.NewRegistry()
-	registry.Register("code_gen", tasks.NewCodeGenHandler(workerClient))
-	registry.Register("text_extract", tasks.NewTextExtractHandler(workerClient))
-
-	// Unified concurrent event bus
 	eventCh := make(chan any, 256)
+	orch := engine.NewOrchestrator(lrm, workerRouter, registry, eventCh)
 
-	// Map OS signals into engine events
+	go func() {
+		if err := orch.RunEventLoop(ctx, nil); err != nil {
+			log.Printf("[Engine] Event loop ended: %v", err)
+		}
+	}()
+
+	// 5. ADK Tools & Agent
+	oCtx := orchagent.OrchestratorContext{
+		EventCh:      eventCh,
+		WorkerRouter: workerRouter,
+		RAGClient:    ragClient,
+	}
+	tools, err := orchagent.BuildTools(oCtx)
+	if err != nil {
+		log.Fatalf("Failed to build ADK tools: %v", err)
+	}
+
+	rootAgent, err := orchagent.NewOrchestratorAgent(lrmModel, tools)
+	if err != nil {
+		log.Fatalf("Failed to create root ADK agent: %v", err)
+	}
+
+	// 6. ADK REST & Streaming SSE Server (Replaces ~600 lines of custom API server)
+	restServer, err := adkrest.NewServer(adkrest.ServerConfig{
+		AgentLoader:     agent.NewSingleLoader(rootAgent),
+		SessionService:  session.InMemoryService(),
+		SSEWriteTimeout: 120 * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("Failed to create ADK REST server: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/api/", http.StripPrefix("/api", restServer))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok","framework":"google-adk-v2"}`))
+	})
+
+	// Worker fleet REST endpoints
+	mux.HandleFunc("GET /api/v1/workers", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(workerRouter.ListWorkers())
+	})
+	mux.HandleFunc("POST /api/v1/workers", func(w http.ResponseWriter, r *http.Request) {
+		var node engine.WorkerNode
+		if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := workerRouter.RegisterWorker(node); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(node)
+	})
+
+	server := &http.Server{
+		Addr:              ":" + *port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-		for sig := range sigCh {
-			eventCh <- engine.SigEvent{Signal: sig}
-		}
+		<-sigCh
+		log.Println("[Main] Shutting down...")
+		cancel()
+		_ = server.Shutdown(context.Background())
 	}()
 
-	// Start HTTP Conversational Intake API
-	srv := api.NewServer(*port, eventCh, lrm)
-	go func() {
-		if err := srv.Start(); err != nil {
-			eventCh <- engine.FatalErrorEvent{Err: err}
-		}
-	}()
-
-	// Optional bootstrap blueprint injection
-	if *blueprintPath != "" {
-		data, err := os.ReadFile(*blueprintPath)
-		if err != nil {
-			log.Fatalf("[Main] Failed to read bootstrap file %s: %v", *blueprintPath, err)
-		}
-		eventCh <- engine.SeedPlanEvent{RawJSON: string(data)}
+	log.Printf("[ADK Orchestrator] Ready. Endpoints: /api/ (ADK REST/SSE), /healthz")
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Server error: %v", err)
 	}
-
-	// Ignite the single-writer actor event loop and block until graceful shutdown
-	orch := engine.NewOrchestrator(lrm, workerClient, registry, eventCh)
-	if err := orch.RunEventLoop(ctx, srv.Shutdown); err != nil {
-		log.Fatalf("[Main] Engine exited with error: %v", err)
-	}
-	log.Println("[Main] Orchestrator shut down gracefully.")
 }

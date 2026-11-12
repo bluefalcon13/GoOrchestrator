@@ -72,10 +72,11 @@ Detailed module documentation is organized into dedicated reference guides:
 
 | Module | Purpose | Documentation |
 | :--- | :--- | :--- |
-| **`llm`** | Dual-tier LLM abstraction, transport retries, multi-hat persona engine, and mock client | [Dual-Tier LLM Architecture](llm.md) |
-| **`engine`** | Actor event loop, Kahn's algorithm DAG validation, task dispatching, and remediation loop | [Engine Actor & DAG Scheduler](engine.md) |
-| **`tasks`** | Domain-agnostic task handler registry, code generation, and text extraction pipelines | [Task Pipeline & Handlers](tasks.md) |
-| **`api`** | Go 1.22+ ServeMux REST API, reply-channel bridging, and OpenAPI 3.1 specification | [Conversational API & OpenAPI](api.md) |
+| **`agent`** | Google ADK Go v2 Conversational Liaison (`llmagent.New`) and Function Tools (`functiontool.New`) | [README](../README.md) |
+| **`engine`** | Actor event loop, Kahn's algorithm DAG validation, WorkerRouter, and remediation loop | [Engine Actor & DAG Scheduler](engine.md) |
+| **`tasks`** | Domain-agnostic task handler registry, code generation, text extraction, and RAG pipelines | [Task Pipeline & Handlers](tasks.md) |
+| **`rag`** | Local Zen 5 embedding, cross-encoder reranking, and Qdrant vector database client | [README](../README.md) |
+| **`llm`** | Transport abstractions, Reviewer/Project Manager hats, schemas, and deterministic mock | [Dual-Tier LLM Architecture](llm.md) |
 
 ---
 

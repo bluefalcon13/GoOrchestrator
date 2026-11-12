@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
 	"go-orchestrator/llm"
+	"go-orchestrator/rag"
 )
 
 // TextExtractParams holds parameters for the text_extract task handler.
@@ -19,12 +21,17 @@ type TextExtractParams struct {
 
 // TextExtractHandler performs chunked extraction of structured insights from unstructured text.
 type TextExtractHandler struct {
-	client llm.LLMClient
+	client    llm.LLMClient
+	ragClient rag.Client
 }
 
 // NewTextExtractHandler creates a new TextExtractHandler.
-func NewTextExtractHandler(client llm.LLMClient) *TextExtractHandler {
-	return &TextExtractHandler{client: client}
+func NewTextExtractHandler(client llm.LLMClient, ragClient ...rag.Client) *TextExtractHandler {
+	var rc rag.Client
+	if len(ragClient) > 0 {
+		rc = ragClient[0]
+	}
+	return &TextExtractHandler{client: client, ragClient: rc}
 }
 
 func (h *TextExtractHandler) Description() string {
@@ -75,6 +82,30 @@ func (h *TextExtractHandler) Execute(ctx context.Context, input TaskInput) (Task
 	}
 	if doc == "" {
 		doc = input.Description
+	}
+
+	// 1. If doc points to a local file path, attempt reading the file contents directly
+	if len(doc) < 300 && strings.Contains(doc, ".") {
+		for _, prefix := range []string{"", "./", "/data/", "data/"} {
+			target := prefix + doc
+			if fileData, err := os.ReadFile(target); err == nil && len(fileData) > 0 {
+				doc = string(fileData)
+				break
+			}
+		}
+	}
+
+	// 2. If doc is still just a short filename/title and RAG is available, retrieve relevant passages
+	if len(doc) < 200 && h.ragClient != nil {
+		searchQuery := input.Title + " " + strings.Join(params.Fields, " ")
+		if matches, err := h.ragClient.SearchAndRerank(ctx, "default_corpus", searchQuery, 20, 5); err == nil && len(matches) > 0 {
+			var sb strings.Builder
+			for _, m := range matches {
+				sb.WriteString(m.Text)
+				sb.WriteString("\n\n")
+			}
+			doc = sb.String()
+		}
 	}
 
 	if len(params.Fields) == 0 {

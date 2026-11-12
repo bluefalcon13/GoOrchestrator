@@ -1,8 +1,6 @@
-# Go Orchestrator
+# Go Orchestrator (ADK v2 & Strix Halo Heterogeneous Stack)
 
-An event-driven agentic orchestration engine written in Go (Go 1.22+). It separates **high-level strategic reasoning** (handled by a Large Reasoning Model wearing multiple cognitive "hats") from **low-level task execution** (handled by fast worker models) over a unified, non-blocking concurrent event bus (`chan any`).
-
-The system avoids shared-memory mutex contention across the core engine by implementing a **single-writer actor event loop** that serves as the sole owner of mutable plan, task, and DAG state.
+An event-driven, heterogeneous AI agent orchestration engine written in Go. Built with **Google ADK Go (`google.golang.org/adk/v2`)**, it coordinates multi-tier reasoning models, hierarchical DAG workflow scheduling, and intelligent hardware dispatching across **AMD Strix Halo APUs (Ryzen AI NPU + Zen 5 CPU cluster + RDNA 3.5 GPU)** and remote GPU fleets.
 
 ---
 
@@ -10,196 +8,190 @@ The system avoids shared-memory mutex contention across the core engine by imple
 
 ```mermaid
 flowchart TD
-    subgraph Intake ["Intake Layer"]
-        HTTP["HTTP API /api/v1/* (Go 1.22 ServeMux)"]
-        SIG["OS Signals (SIGINT, SIGTERM)"]
-        BOOT["Bootstrap Blueprint JSON"]
+    subgraph Intake ["Intake & Streaming (ADK REST / SSE)"]
+        CLIENT["Web UI / IDE / Continue / API"]
+        ADK_REST["ADK REST & SSE Server (/api/*)"]
+        HEALTH["Healthz (/healthz)"]
+        WORKER_API["Worker Fleet API (/api/v1/workers)"]
     end
 
-    subgraph Bus ["Unified Concurrent Event Bus"]
-        CH["chan any (Buffered Actor Mailbox)"]
+    subgraph AgentLayer ["ADK Agent & Liaison Layer"]
+        LIAISON["Root Conversational Liaison (llmagent.New)"]
+        TOOLS["ADK Function Tools (functiontool.New)"]
+        TOOLS --> T_DRAFT["draft_plan"]
+        TOOLS --> T_APPROVE["approve_plan"]
+        TOOLS --> T_STATUS["get_plan_status"]
+        TOOLS --> T_WORKERS["list_workers"]
+        TOOLS --> T_RAG["rag_search"]
     end
 
-    subgraph Engine ["Core Engine Actor"]
-        LOOP["Single-Writer Actor Event Loop"]
-        DAG["DAG Scheduler & Cycle Detector (Kahn's)"]
-        ROLL["Hierarchical Status Rollup"]
+    subgraph CoreEngine ["Core Engine Actor & DAG Scheduler"]
+        BUS["Concurrent Event Bus (chan any)"]
+        ACTOR["Single-Writer Actor Event Loop"]
+        DAG["Kahn's Topological DAG Scheduler"]
+        SPLICER["ActionSplit Graph Splicer"]
     end
 
-    subgraph DualTierLLM ["Dual-Tier LLM Architecture"]
-        LRM["LRM Multi-Hat Persona Engine"]
-        LRM_HAT1["Conversational Hat"]
-        LRM_HAT2["Planner Hat"]
-        LRM_HAT3["Reviewer Hat"]
-        LRM_HAT4["Project Manager Hat"]
-        WORKER["Small Task Model (Worker)"]
+    subgraph Floater ["The Floater (Supervisor Roles)"]
+        REVIEWER["Reviewer Hat (Deterministic Quality Gate)"]
+        PM["Project Manager Hat (ActionSplit / Triage)"]
     end
 
-    subgraph Tasks ["Task Pipeline"]
-        REG["Task Registry"]
-        H_CODE["CodeGenHandler"]
-        H_TEXT["TextExtractHandler"]
+    subgraph RoutingLayer ["Context-Aware Worker Router"]
+        ROUTER["WorkerRouter (Context-Aware Dispatch)"]
     end
 
-    HTTP -->|Queries & Commands with ReplyCh| CH
-    SIG -->|SigEvent| CH
-    BOOT -->|SeedPlanEvent| CH
-    CH --> LOOP
+    subgraph HardwareExecution ["Heterogeneous Hardware Fleet"]
+        NPU["AMD XDNA 2 NPU (Ryzen AI :8001)<br/>Serial Queue (batch=1) | <= 8192 tokens"]
+        GPU["Remote GPU Fleet (Desktop Radeon 9070XT)<br/>Full Context (32k/64k) | > 8192 tokens"]
+        ZEN5["Zen 5 CPU Cluster<br/>nomic-embed + bge-reranker + Qdrant"]
+    end
 
-    LOOP <--> DAG
-    LOOP <--> ROLL
+    CLIENT <--> ADK_REST
+    ADK_REST <--> LIAISON
+    LIAISON <--> TOOLS
+    TOOLS -->|Commands & Queries| BUS
+    BUS --> ACTOR
 
-    LOOP -->|Dispatch Task| REG
-    REG --> H_CODE & H_TEXT
-    H_CODE & H_TEXT --> WORKER
-    H_CODE & H_TEXT -->|TaskExecutionResultEvent| CH
+    ACTOR <--> DAG
+    ACTOR <--> SPLICER
+    ACTOR -->|Validate Output| REVIEWER
+    ACTOR -->|Escalate on 413/Failures| PM
+    PM -->|Remediation: ActionSplit| SPLICER
 
-    LOOP -->|Review Task Output| LRM_HAT3
-    LRM_HAT3 -->|TaskReviewResultEvent| CH
-
-    LOOP -->|Escalate on Retries or NeedsClarification| LRM_HAT4
-    LRM_HAT4 -->|RemediationResultEvent: Split / Clarify / Fail| CH
-
-    HTTP <-->|Interactive Reasoning| LRM_HAT1
-    HTTP <-->|Draft Plan Generation| LRM_HAT2
+    ACTOR -->|Dispatch Leaf Tasks| ROUTER
+    ROUTER -- "<= 8192 tokens" --> NPU
+    ROUTER -- "> 8192 tokens / Overflow" --> GPU
+    T_RAG <--> ZEN5
 ```
 
 ---
 
-## Key Features
+## Key Pillars
 
-1. **Dual-Tier Cognitive Model:**
-   - **Large Reasoning Model (LRM):** A single LLM wrapped in strongly-typed system-prompt profiles:
-     - **Conversational Hat:** Operates over live system state snapshots, explains blockers, and classifies user chat into draft plans.
-     - **Planner Hat:** Decomposes user directives into hierarchical plans (**Epics $\rightarrow$ Stories $\rightarrow$ Tasks**) forming a verifiable DAG.
-     - **Reviewer Hat:** Validates completed worker outputs against objective acceptance criteria (`Approved`, `Feedback`, `NeedsClarification`, `Score`).
-     - **Project Manager Hat:** Triages failing tasks, executing dynamic DAG re-decomposition (`split`) or pausing branches for user input (`clarify`).
-   - **Small Task Model (Worker):** Executes atomic leaf tasks using only targeted local context (task spec, direct upstream dependency outputs, and reviewer feedback).
+### 1. Powered by Google ADK Go (`v2`)
+* **Conversational Liaison**: Root reasoning loop implemented using `llmagent.New(...)` backed by `openaimodel.NewModel` connecting to Gemma 4 26B on vLLM.
+* **REST & SSE Server**: Out-of-the-box streaming and session management via `adkrest.NewServer` mounted at `/api/`.
+* **Zero Boilerplate**: Eliminated ~2,600 lines of custom Swagger generators, hand-rolled HTTP multiplexers, and bespoke JSON-RPC layers.
 
-2. **Single-Writer Actor State Machine:**
-   - All mutable state lives inside the event loop goroutine.
-   - External callers (HTTP requests, worker goroutines) communicate strictly by sending event structs over `eventCh chan any`. Synchronous HTTP handlers embed a buffered `replyCh` to receive responses without locks.
+### 2. Heterogeneous AMD Hardware Execution
+* **AMD XDNA 2 NPU Worker (`onnx_goworker` on `:8001`)**:
+  * Pinned to a single OS thread via `runtime.LockOSThread()`.
+  * Serial queue (`batch = 1`) with hardware warmup on startup.
+  * Hard 8,192 token context limit check with fast-fail `HTTP 413 Payload Too Large`.
+  * Preserved `/v1/completions` for instant tab autocomplete in VS Code Continue.
+* **Context-Aware Worker Router**:
+  * $\le$ 8,192 tokens $\rightarrow$ routed to local energy-efficient NPU.
+  * \> 8,192 tokens $\rightarrow$ routed to desktop Radeon RX 9070XT GPU worker.
+  * **Auto-Splitting on GPU Offline**: If remote GPU is offline or NPU returns HTTP 413, the task is immediately escalated to the Project Manager Hat (`ActionSplit`) to be spliced into smaller sub-tasks that fit the local 8k window.
 
-3. **Kahn's Algorithm DAG Scheduler:**
-   - Go-side structural validation verifies dependency integrity, handler registration, and cycle-free topological order before any plan or spliced sub-graph executes.
+### 3. Core Engine & Kahn's Topological DAG Scheduler
+* **Single-Writer Actor State Machine**: All mutable workflow state is owned by a single actor goroutine over `chan any`.
+* **Dynamic Graph Splicing**: Tasks that fail or exceed context limits are split into sub-tasks. The parent task becomes a join node in Kahn's DAG, preserving downstream dependencies.
+* **Strict Quality Gates**: The Reviewer Hat deterministically evaluates outputs against verifiable acceptance criteria before permitting downstream tasks to execute.
 
-4. **Self-Healing Remediation & Clarification Loop:**
-   - **Tactical Retry:** Failed worker tasks append reviewer feedback and retry up to `MaxRetries` (default: 3).
-   - **Dynamic DAG Splicing (`ActionSplit`):** Tasks too complex for a small model are decomposed into sub-tasks. The original task becomes a join node waiting on terminal sub-tasks, preserving downstream dependencies.
-   - **Targeted Clarification (`ActionClarify`):** Ambiguous tasks pause in `StatusAwaitingClarification`. Transitive dependents transition to `StatusBlocked`, while independent DAG branches continue executing concurrently.
-   - **Resumption:** User clarifications submitted via the API resume the paused branch without discarding upstream work.
-
-5. **Production Deployment Options:**
-   - Host binary compilation, static linking, and ultra-minimal `FROM scratch` containerization (~13MB, zero CVE surface, non-root UID `10001`, no CA cert overhead needed for Cloudflare Tunnel setups).
+### 4. Zen 5 Local RAG Cluster
+* **Dense Embedding**: `llama-embed` running `nomic-embed-text-v1.5.Q8_0` with AVX-512 acceleration.
+* **Cross-Encoder Reranker**: `llama-rerank` running `bge-reranker-large-Q8_0`.
+* **Vector Store**: High-performance local Qdrant instance.
 
 ---
 
 ## Quickstart
 
 ### Prerequisites
-- Go 1.22+ (tested with Go 1.22+)
-- Make (optional, for build shortcuts)
-- Docker (optional, for container builds)
+- Go 1.24+ (or Go 1.26+)
+- Docker & Docker Compose with AMD ROCm / Ryzen AI support
 
-### 1. Build and Run on Host
-
-```bash
-# Build binary into ./build/orchestrator
-make build
-
-# Run in offline mock mode (runs immediately without local model servers or API keys)
-./build/orchestrator -blueprint example_blueprint.json -port 8080
-```
-
-### 2. Run Tests
+### Running Locally
 
 ```bash
-# Run all unit and integration tests across all packages
-make test
+# Clone and build static binary
+cd orchestrator
+go build -o /tmp/orchestrator .
 
-# Run tests with coverage profile
-make test-coverage
-```
-
-### 3. Connect to Real LLM Endpoints
-
-`GoOrchestrator` speaks the standard OpenAI-compatible `/v1/chat/completions` API (vLLM, Ollama, llama.cpp, LocalAI, TGI, or cloud providers):
-
-```bash
-./build/orchestrator \
-  -mode http \
+# Run with full stack endpoints
+/tmp/orchestrator \
+  -port 8080 \
   -lrm-url http://localhost:8000 \
   -worker-url http://localhost:8001 \
-  -port 8080
+  -embed-url http://localhost:8082 \
+  -rerank-url http://localhost:8083 \
+  -qdrant-url http://localhost:6333
+```
+
+### Running with Docker Compose
+
+From the root of `local_ai_stack`:
+
+```bash
+# Build and ignite the orchestrator container
+docker compose up -d --build orchestrator
+```
+
+### Running Tests
+
+```bash
+# Run all unit tests across engine, agent, tasks, and rag
+go test -count=1 ./...
 ```
 
 ---
 
-## API Summary
+## ADK Tools & Endpoints
 
-The HTTP API uses Go 1.22 method+path routing:
+### ADK Tools (Function Calling)
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `draft_plan` | `title`, `objective`, `epics` | Validates acyclic DAG plan and registers it as a draft awaiting user approval. |
+| `approve_plan` | `plan_id` | Approves a validated draft and launches execution across the NPU/GPU fleet. |
+| `get_plan_status` | `plan_id` | Inspects real-time execution status, leaf tasks, retries, and generated artifacts. |
+| `list_workers` | *(none)* | Queries registered hardware workers, context ceilings, and telemetry. |
+| `rag_search` | `query`, `collection`, `top_k` | Runs vector search with cross-encoder reranking over local documentation and code. |
+
+### REST Endpoints
 
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
-| `/api/v1/chat` | `POST` | Conversational intake, live status queries, and automatic DAG plan drafting. |
-| `/api/v1/plans` | `GET` | Lists all execution plans and their statuses. |
-| `/api/v1/plans/{planID}` | `GET` | Returns real-time hierarchical plan tree, outputs, and pending questions. |
-| `/api/v1/plans/{planID}/approve` | `POST` | Approves a draft plan or injects a raw JSON plan spec. |
-| `/api/v1/plans/{planID}/tasks/{taskID}/clarify` | `POST` | Submits user clarification for a paused task, unblocking dependents. |
-| `/openapi.yaml` | `GET` | Serves the embedded OpenAPI 3.1 specification. |
-| `/healthz` | `GET` | Health check endpoint (`{"status": "ok"}`). |
+| `/api/*` | `GET`, `POST` | ADK REST & SSE Streaming protocol for client applications. |
+| `/api/v1/workers` | `GET` | Returns list of registered worker nodes and their active status. |
+| `/api/v1/workers` | `POST` | Registers a new remote GPU worker (e.g. desktop 9070XT) into the router. |
+| `/healthz` | `GET` | Health check (`{"status":"ok","framework":"google-adk-v2"}`). |
 
 ---
 
 ## Project Structure
 
 ```
-GoOrchestrator/
-├── Makefile                          # Build, static linking, test, and container targets
-├── .gitignore                        # Ignores build artifacts, coverage files, and binaries
-├── example_blueprint.json            # Example bootstrap plan (Epics -> Stories -> Tasks)
-├── builder/
-│   ├── Dockerfile                    # Minimalist multi-stage FROM scratch container (~13MB)
-│   └── example_docker_compose.yaml   # Stack with orchestrator, Cloudflare tunnel & local vLLM
-├── docs/
-│   ├── overview.md                   # System architecture and end-to-end design
-│   ├── build.md                      # Compilation, static linking, and container deployment
-│   ├── engine.md                     # Actor event loop, Kahn's DAG algorithm, and remediation
-│   ├── llm.md                        # Dual-tier model architecture, multi-hat engine, and mock
-│   ├── tasks.md                      # TaskHandler interface, CodeGen, and TextExtract pipelines
-│   └── api.md                        # Go 1.22 ServeMux REST API and OpenAPI 3.1
-├── api/                              # REST API and reply-channel bridge
-├── engine/                           # Actor event loop and DAG scheduler
-├── llm/                              # Model access layer and multi-hat persona engine
-└── tasks/                            # Domain-agnostic task execution pipeline
+orchestrator/
+├── main.go                     # Entrypoint: ADK REST server, WorkerRouter, Kahn engine
+├── agent/
+│   ├── chat.go                 # Root Conversational Liaison Agent (llmagent.New)
+│   └── tools.go                # ADK Function Tools (draft_plan, approve_plan, rag_search, etc.)
+├── engine/
+│   ├── dag.go                  # Kahn's topological scheduler & cycle validator
+│   ├── orchestrator.go         # Actor event loop, task execution, and Reviewer/PM escalation
+│   ├── worker_router.go        # Context-aware worker dispatch (NPU vs. 9070XT)
+│   └── types.go                # Plan, Task, and Actor Event definitions
+├── llm/
+│   ├── client.go               # LLMClient interface & transport abstraction
+│   ├── lrm.go                  # Multi-hat persona engine (Reviewer & PM hats)
+│   ├── schema.go               # Structured plan, review, and remediation schemas
+│   └── mock.go                 # Deterministic offline mock for millisecond unit tests
+├── rag/
+│   └── client.go               # Zen 5 Embedding, Reranking, and Qdrant vector client
+├── tasks/
+│   ├── registry.go             # TaskHandler interface & thread-safe registry
+│   ├── codegen.go              # Leaf code generator handler
+│   ├── extract.go              # Leaf text extraction handler
+│   └── rag.go                  # Ingestion & search task handlers
+└── builder/
+    └── Dockerfile              # Multi-stage static FROM scratch container (~13MB)
 ```
-
----
-
-## Documentation
-
-Detailed documentation is available in the [`docs/`](./docs) directory:
-- [System Architecture & Overview](docs/overview.md)
-- [Build, Packaging & Docker Deployment](docs/build.md)
-- [Engine Actor & DAG Scheduler](docs/engine.md)
-- [Dual-Tier LLM Architecture](docs/llm.md)
-- [Task Pipeline & Handlers](docs/tasks.md)
-- [Conversational API & Specifications](docs/api.md)
-- [Swagger 2.0 API Spec (YAML)](docs/swagger.yaml)
-- [Swagger 2.0 API Spec (JSON)](docs/swagger.json)
-
----
-
-## Acknowledgments
-
-This project was built collaboratively by:
-- **Lead Architect & Developer:** [bluefalcon13](https://github.com/bluefalcon13)
-- **AI Collaborators:** Antigravity (Google DeepMind) & Claude Opus (Anthropic)
 
 ---
 
 ## License
 
 This project is licensed under the terms of the [MIT License](LICENSE).
-
-
