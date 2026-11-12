@@ -113,6 +113,10 @@ func main() {
 		_, _ = w.Write([]byte(`{"status":"ok","framework":"google-adk-v2"}`))
 	})
 
+	// MCP SSE Server for VS Code Continue
+	mcpServer := orchagent.NewMCPServer(oCtx)
+	mcpServer.RegisterRoutes(mux)
+
 	// Worker fleet REST endpoints
 	mux.HandleFunc("GET /api/v1/workers", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

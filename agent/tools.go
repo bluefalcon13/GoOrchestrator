@@ -90,6 +90,8 @@ func NewDraftPlanTool(eventCh chan any) (tool.Tool, error) {
 		planID := planSpec.ID
 		if strID, ok := cmdRes.Data.(string); ok && strID != "" {
 			planID = strID
+		} else if pSpec, ok := cmdRes.Data.(llm.PlanSpec); ok && pSpec.ID != "" {
+			planID = pSpec.ID
 		}
 
 		return fmt.Sprintf("DRAFT PLAN CREATED (ID: %s)\nStatus: Draft (Awaiting User Approval)\nObjective: %s\n"+

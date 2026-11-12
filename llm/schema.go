@@ -46,6 +46,105 @@ type PlanSpec struct {
 	Epics     []EpicSpec `json:"epics"`
 }
 
+func (t *TaskSpec) UnmarshalJSON(data []byte) error {
+	type Alias TaskSpec
+	aux := struct {
+		*Alias
+		TaskID     string `json:"task_id"`
+		TaskName   string `json:"task_name"`
+		Name       string `json:"name"`
+		Identifier string `json:"identifier"`
+	}{
+		Alias: (*Alias)(t),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if t.ID == "" {
+		if aux.TaskID != "" {
+			t.ID = aux.TaskID
+		} else if aux.Identifier != "" {
+			t.ID = aux.Identifier
+		}
+	}
+	if t.Title == "" {
+		if aux.Name != "" {
+			t.Title = aux.Name
+		} else if aux.TaskName != "" {
+			t.Title = aux.TaskName
+		}
+	}
+	return nil
+}
+
+func (s *StorySpec) UnmarshalJSON(data []byte) error {
+	type Alias StorySpec
+	aux := struct {
+		*Alias
+		StoryID string `json:"story_id"`
+		Name    string `json:"name"`
+	}{
+		Alias: (*Alias)(s),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if s.ID == "" && aux.StoryID != "" {
+		s.ID = aux.StoryID
+	}
+	if s.Title == "" && aux.Name != "" {
+		s.Title = aux.Name
+	}
+	return nil
+}
+
+func (e *EpicSpec) UnmarshalJSON(data []byte) error {
+	type Alias EpicSpec
+	aux := struct {
+		*Alias
+		EpicID string `json:"epic_id"`
+		Name   string `json:"name"`
+	}{
+		Alias: (*Alias)(e),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if e.ID == "" && aux.EpicID != "" {
+		e.ID = aux.EpicID
+	}
+	if e.Title == "" && aux.Name != "" {
+		e.Title = aux.Name
+	}
+	return nil
+}
+
+func (p *PlanSpec) UnmarshalJSON(data []byte) error {
+	type Alias PlanSpec
+	aux := struct {
+		*Alias
+		PlanID   string `json:"plan_id"`
+		Name     string `json:"name"`
+		PlanName string `json:"plan_name"`
+	}{
+		Alias: (*Alias)(p),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if p.ID == "" && aux.PlanID != "" {
+		p.ID = aux.PlanID
+	}
+	if p.Title == "" {
+		if aux.Name != "" {
+			p.Title = aux.Name
+		} else if aux.PlanName != "" {
+			p.Title = aux.PlanName
+		}
+	}
+	return nil
+}
+
 // ParsePlanSpec decodes a plan document, tolerating surrounding prose/fences,
 // wrapper objects (e.g. {"plan": {...}}), and direct tasks under epics.
 func ParsePlanSpec(raw string) (PlanSpec, error) {
