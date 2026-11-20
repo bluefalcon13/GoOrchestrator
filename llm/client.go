@@ -152,7 +152,7 @@ func NewClient(baseURL string, opts ...ClientOption) LLMClient {
 		opt(&cfg)
 	}
 	if cfg.mode == ModeHTTP {
-		return newHTTPClient(baseURL, cfg)
+		return newADKHTTPClient(baseURL, cfg)
 	}
 	return NewMockClient("mock-"+cfg.model, cfg.mockLatency)
 }

@@ -102,3 +102,7 @@ func (m *MockRAGClient) IndexText(ctx context.Context, collection string, text s
 	return 1, nil
 }
 
+func (m *MockRAGClient) IndexFile(ctx context.Context, collection string, filePath string, chunkSize int) (int, error) {
+	return m.IndexText(ctx, collection, "mock file content from "+filePath, filePath, chunkSize)
+}
+

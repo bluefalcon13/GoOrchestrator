@@ -89,3 +89,11 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+

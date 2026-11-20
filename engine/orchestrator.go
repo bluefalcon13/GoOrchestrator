@@ -5,26 +5,37 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/agent/workflowagent"
+	"google.golang.org/adk/v2/runner"
+	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/workflow"
+	"google.golang.org/genai"
+
 	"go-orchestrator/llm"
 	"go-orchestrator/tasks"
 )
 
-// Orchestrator coordinates the single-writer actor event loop, DAG scheduler,
-// worker dispatch, and multi-tier LRM review/escalation loop.
+// Orchestrator coordinates plan lifecycle, DAG execution via google.golang.org/adk/v2/workflow,
+// worker dispatch, and multi-tier LRM review/escalation.
 type Orchestrator struct {
+	mu           sync.RWMutex
 	lrm          *llm.LRMPersonaEngine
 	workerClient llm.LLMClient
 	registry     *tasks.Registry
 	eventCh      chan any
 	plans        map[string]*PlanNode
 	draftPlans   map[string]llm.PlanSpec
+	planCancels  map[string]context.CancelFunc
 	maxRetries   int
 	log          *slog.Logger
 	wg           sync.WaitGroup
@@ -37,20 +48,26 @@ func NewOrchestrator(
 	registry *tasks.Registry,
 	eventCh chan any,
 ) *Orchestrator {
+	drafts := make(map[string]llm.PlanSpec)
+	if data, err := os.ReadFile("/data/draft_plans.json"); err == nil {
+		_ = json.Unmarshal(data, &drafts)
+	}
+
 	return &Orchestrator{
 		lrm:          lrm,
 		workerClient: workerClient,
 		registry:     registry,
 		eventCh:      eventCh,
 		plans:        make(map[string]*PlanNode),
-		draftPlans:   make(map[string]llm.PlanSpec),
+		draftPlans:   drafts,
+		planCancels:  make(map[string]context.CancelFunc),
 		maxRetries:   3,
 		log:          slog.Default(),
 	}
 }
 
-// RunEventLoop is the single-writer actor event loop. It blocks until a SigEvent
-// or cancellation signal is received, then initiates graceful shutdown.
+// RunEventLoop processes external control/query commands while ADK workflow
+// runners execute active plan DAGs asynchronously.
 func (o *Orchestrator) RunEventLoop(ctx context.Context, srvShutdown func(context.Context) error) error {
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 	defer cancelWorkers()
@@ -81,22 +98,11 @@ func (o *Orchestrator) RunEventLoop(ctx context.Context, srvShutdown func(contex
 			case SeedPlanEvent:
 				o.handleSeedPlan(workerCtx, ev)
 
-			case TaskExecutionResultEvent:
-				o.handleTaskExecutionResult(workerCtx, ev)
-
-			case TaskReviewResultEvent:
-				o.handleTaskReviewResult(workerCtx, ev)
-
-			case TaskEscalatedEvent:
-				o.handleTaskEscalated(workerCtx, ev)
-
-			case RemediationResultEvent:
-				o.handleRemediationResult(workerCtx, ev)
-
 			case ClarificationResolvedEvent:
 				o.handleClarificationResolved(workerCtx, ev)
 
 			case GetPlanQuery:
+				o.mu.RLock()
 				plan, exists := o.plans[ev.PlanID]
 				if !exists {
 					if draft, ok := o.draftPlans[ev.PlanID]; ok {
@@ -106,9 +112,12 @@ func (o *Orchestrator) RunEventLoop(ctx context.Context, srvShutdown func(contex
 						exists = true
 					}
 				}
-				ev.ReplyCh <- GetPlanResult{Plan: clonePlan(plan), Found: exists}
+				cloned := clonePlan(plan)
+				o.mu.RUnlock()
+				ev.ReplyCh <- GetPlanResult{Plan: cloned, Found: exists}
 
 			case ListPlansQuery:
+				o.mu.RLock()
 				list := make([]*PlanNode, 0, len(o.plans)+len(o.draftPlans))
 				for _, p := range o.plans {
 					list = append(list, clonePlan(p))
@@ -118,17 +127,23 @@ func (o *Orchestrator) RunEventLoop(ctx context.Context, srvShutdown func(contex
 					draftNode.Status = PlanStatusDraft
 					list = append(list, draftNode)
 				}
+				o.mu.RUnlock()
 				sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
 				ev.ReplyCh <- list
 
 			case GetSystemStateQuery:
-				ev.ReplyCh <- o.formatSystemStateSummary()
+				o.mu.RLock()
+				summary := o.formatSystemStateSummaryLocked()
+				o.mu.RUnlock()
+				ev.ReplyCh <- summary
 
 			case GetDraftPlansQuery:
+				o.mu.RLock()
 				drafts := make([]llm.PlanSpec, 0, len(o.draftPlans))
 				for _, d := range o.draftPlans {
 					drafts = append(drafts, d)
 				}
+				o.mu.RUnlock()
 				ev.ReplyCh <- drafts
 
 			case StoreDraftPlanCommand:
@@ -138,7 +153,7 @@ func (o *Orchestrator) RunEventLoop(ctx context.Context, srvShutdown func(contex
 				o.handlePausePlan(ev)
 
 			case ResumePlanCommand:
-				o.handleResumePlan(ctx, ev)
+				o.handleResumePlan(workerCtx, ev)
 
 			default:
 				o.log.Warn("unhandled event type", "type", fmt.Sprintf("%T", event))
@@ -154,10 +169,8 @@ func (o *Orchestrator) RunEventLoop(ctx context.Context, srvShutdown func(contex
 func (o *Orchestrator) shutdown(cancelWorkers context.CancelFunc, srvShutdown func(context.Context) error) error {
 	o.log.Info("commencing graceful shutdown sequence")
 
-	// 1. Cancel in-flight workers
 	cancelWorkers()
 
-	// 2. Shut down HTTP server
 	if srvShutdown != nil {
 		shutdownCtx, srvCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer srvCancel()
@@ -166,7 +179,6 @@ func (o *Orchestrator) shutdown(cancelWorkers context.CancelFunc, srvShutdown fu
 		}
 	}
 
-	// 3. Drain active worker goroutines with bounded timeout
 	drainCh := make(chan struct{})
 	go func() {
 		o.wg.Wait()
@@ -184,14 +196,22 @@ func (o *Orchestrator) shutdown(cancelWorkers context.CancelFunc, srvShutdown fu
 }
 
 // ---------------------------------------------------------------------------
-// Plan Ingestion and Seeding
+// Plan Ingestion, Draft Persistence, Pause & Resume
 // ---------------------------------------------------------------------------
 
-func (o *Orchestrator) handleSeedPlan(ctx context.Context, ev SeedPlanEvent) {
+func (o *Orchestrator) persistDraftPlansLocked() {
+	if data, err := json.Marshal(o.draftPlans); err == nil {
+		_ = os.WriteFile("/data/draft_plans.json", data, 0644)
+	}
+}
+
+func (o *Orchestrator) handleSeedPlan(workerCtx context.Context, ev SeedPlanEvent) {
 	var spec llm.PlanSpec
 	var err error
 
+	o.mu.Lock()
 	if strings.TrimSpace(ev.RawJSON) != "" {
+		o.mu.Unlock()
 		spec, err = llm.ParsePlanSpec(ev.RawJSON)
 		if err != nil {
 			o.log.Error("failed to parse plan JSON", "err", err)
@@ -200,10 +220,10 @@ func (o *Orchestrator) handleSeedPlan(ctx context.Context, ev SeedPlanEvent) {
 			}
 			return
 		}
+		o.mu.Lock()
 	} else if ev.PlanID != "" {
 		draft, ok := o.draftPlans[ev.PlanID]
 		if !ok {
-			// Fuzzy auto-healing: prefix/substring match or single draft fallback
 			for dID, d := range o.draftPlans {
 				if strings.HasPrefix(dID, ev.PlanID) || strings.HasPrefix(ev.PlanID, dID) || strings.Contains(dID, ev.PlanID) {
 					draft = d
@@ -222,6 +242,7 @@ func (o *Orchestrator) handleSeedPlan(ctx context.Context, ev SeedPlanEvent) {
 			}
 		}
 		if !ok {
+			o.mu.Unlock()
 			o.log.Error("draft plan not found in registry", "plan_id", ev.PlanID)
 			if ev.ReplyCh != nil {
 				ev.ReplyCh <- CommandResult{Success: false, Message: fmt.Sprintf("draft plan %q not found", ev.PlanID), Err: fmt.Errorf("draft plan not found")}
@@ -230,13 +251,13 @@ func (o *Orchestrator) handleSeedPlan(ctx context.Context, ev SeedPlanEvent) {
 		}
 		spec = draft
 	} else if len(o.draftPlans) == 1 {
-		// PlanID was omitted, auto-resolve single pending draft
 		for dID, d := range o.draftPlans {
 			spec = d
 			ev.PlanID = dID
 			break
 		}
 	} else {
+		o.mu.Unlock()
 		o.log.Error("seed plan requires either RawJSON or PlanID")
 		if ev.ReplyCh != nil {
 			ev.ReplyCh <- CommandResult{Success: false, Message: "missing plan specification", Err: fmt.Errorf("neither RawJSON nor PlanID provided")}
@@ -251,8 +272,8 @@ func (o *Orchestrator) handleSeedPlan(ctx context.Context, ev SeedPlanEvent) {
 		spec.ID = GeneratePlanSlug(spec.Title)
 	}
 
-	// Run Go-side structural DAG validation
 	if _, err := ValidatePlanSpec(spec, o.registry); err != nil {
+		o.mu.Unlock()
 		o.log.Error("plan failed structural DAG validation", "plan_id", spec.ID, "err", err)
 		if ev.ReplyCh != nil {
 			ev.ReplyCh <- CommandResult{Success: false, Message: "structural DAG validation failed", Err: err}
@@ -260,18 +281,20 @@ func (o *Orchestrator) handleSeedPlan(ctx context.Context, ev SeedPlanEvent) {
 		return
 	}
 
-	// Convert to active execution tree
 	planNode := o.createPlanNode(spec)
 	o.plans[planNode.ID] = planNode
-	delete(o.draftPlans, planNode.ID)
+	if _, existed := o.draftPlans[planNode.ID]; existed {
+		delete(o.draftPlans, planNode.ID)
+		o.persistDraftPlansLocked()
+	}
+	o.mu.Unlock()
 
 	o.log.Info("plan accepted into active execution", "plan_id", planNode.ID, "title", planNode.Title)
 	if ev.ReplyCh != nil {
 		ev.ReplyCh <- CommandResult{Success: true, Message: "plan accepted into execution", Data: planNode.ID}
 	}
 
-	// Evaluate DAG and dispatch initial ready tasks
-	o.evaluateAndDispatch(ctx, planNode)
+	o.launchPlanWorkflow(workerCtx, planNode.ID)
 }
 
 // GeneratePlanSlug creates a normalized plan ID slug from its title.
@@ -304,20 +327,24 @@ func GeneratePlanSlug(title string) string {
 	}
 
 	hash := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", title, time.Now().UnixNano())))
-	suffix := hex.EncodeToString(hash[:2]) // 4 hex chars
+	suffix := hex.EncodeToString(hash[:2])
 	return fmt.Sprintf("%s-%s", res, suffix)
 }
 
 func (o *Orchestrator) handleStoreDraftPlan(ev StoreDraftPlanCommand) {
+	o.mu.Lock()
 	spec := ev.Plan
 	if spec.ID == "" {
 		spec.ID = GeneratePlanSlug(spec.Title)
 	}
 	o.draftPlans[spec.ID] = spec
+	o.persistDraftPlansLocked()
+	o.mu.Unlock()
 	ev.ReplyCh <- CommandResult{Success: true, Message: "draft plan saved", Data: spec}
 }
 
 func (o *Orchestrator) handlePausePlan(ev PausePlanCommand) {
+	o.mu.Lock()
 	var target *PlanNode
 	if ev.PlanID != "" {
 		target = o.plans[ev.PlanID]
@@ -329,8 +356,8 @@ func (o *Orchestrator) handlePausePlan(ev PausePlanCommand) {
 			}
 		}
 	}
-
 	if target == nil {
+		o.mu.Unlock()
 		if ev.ReplyCh != nil {
 			ev.ReplyCh <- CommandResult{Success: false, Message: "no active plan found to pause", Err: fmt.Errorf("plan not found")}
 		}
@@ -339,13 +366,21 @@ func (o *Orchestrator) handlePausePlan(ev PausePlanCommand) {
 
 	target.Status = PlanStatusPaused
 	target.UpdatedAt = time.Now()
-	o.log.Info("plan execution paused", "plan_id", target.ID)
+	if cancel, ok := o.planCancels[target.ID]; ok {
+		cancel()
+		delete(o.planCancels, target.ID)
+	}
+	planID := target.ID
+	o.mu.Unlock()
+
+	o.log.Info("plan execution paused", "plan_id", planID)
 	if ev.ReplyCh != nil {
-		ev.ReplyCh <- CommandResult{Success: true, Message: fmt.Sprintf("plan %s paused", target.ID), Data: target.ID}
+		ev.ReplyCh <- CommandResult{Success: true, Message: fmt.Sprintf("plan %s paused", planID), Data: planID}
 	}
 }
 
-func (o *Orchestrator) handleResumePlan(ctx context.Context, ev ResumePlanCommand) {
+func (o *Orchestrator) handleResumePlan(workerCtx context.Context, ev ResumePlanCommand) {
+	o.mu.Lock()
 	var target *PlanNode
 	if ev.PlanID != "" {
 		target = o.plans[ev.PlanID]
@@ -357,8 +392,8 @@ func (o *Orchestrator) handleResumePlan(ctx context.Context, ev ResumePlanComman
 			}
 		}
 	}
-
 	if target == nil {
+		o.mu.Unlock()
 		if ev.ReplyCh != nil {
 			ev.ReplyCh <- CommandResult{Success: false, Message: "no paused plan found to resume", Err: fmt.Errorf("plan not found")}
 		}
@@ -367,12 +402,607 @@ func (o *Orchestrator) handleResumePlan(ctx context.Context, ev ResumePlanComman
 
 	target.Status = PlanStatusRunning
 	target.UpdatedAt = time.Now()
-	o.log.Info("plan execution resumed", "plan_id", target.ID)
+	planID := target.ID
+	o.mu.Unlock()
+
+	o.log.Info("plan execution resumed", "plan_id", planID)
 	if ev.ReplyCh != nil {
-		ev.ReplyCh <- CommandResult{Success: true, Message: fmt.Sprintf("plan %s resumed", target.ID), Data: target.ID}
+		ev.ReplyCh <- CommandResult{Success: true, Message: fmt.Sprintf("plan %s resumed", planID), Data: planID}
 	}
-	o.evaluateAndDispatch(ctx, target)
+	o.launchPlanWorkflow(workerCtx, planID)
 }
+
+func (o *Orchestrator) handleClarificationResolved(workerCtx context.Context, ev ClarificationResolvedEvent) {
+	o.mu.Lock()
+	plan, ok := o.plans[ev.PlanID]
+	if !ok {
+		o.mu.Unlock()
+		if ev.ReplyCh != nil {
+			ev.ReplyCh <- CommandResult{Success: false, Message: "plan not found"}
+		}
+		return
+	}
+	task := o.findTaskLocked(plan, ev.TaskID)
+	if task == nil {
+		o.mu.Unlock()
+		if ev.ReplyCh != nil {
+			ev.ReplyCh <- CommandResult{Success: false, Message: "task not found"}
+		}
+		return
+	}
+
+	o.log.Info("applying clarification to paused task", "plan_id", ev.PlanID, "task_id", ev.TaskID)
+
+	task.Description = ev.Interpretation.AmendedDescription
+	task.AcceptanceCriteria = append(task.AcceptanceCriteria, ev.Interpretation.AdditionalAcceptanceCriteria...)
+	task.Clarifications = append(task.Clarifications, ev.Answer)
+	task.PendingExplanation = ""
+	task.PendingQuestion = ""
+	task.Attempts = 0
+	task.Status = StatusPending
+	task.UpdatedAt = time.Now()
+
+	downstreamMap, _ := BuildAdjacencyLists(plan)
+	dependents := FindTransitiveDependents(task.ID, downstreamMap)
+	for _, depID := range dependents {
+		if dep := o.findTaskLocked(plan, depID); dep != nil && dep.Status == StatusBlocked {
+			dep.Status = StatusPending
+			dep.UpdatedAt = time.Now()
+		}
+	}
+	o.rollupPlanLocked(plan)
+	taskCopy := *task
+	o.mu.Unlock()
+
+	if ev.ReplyCh != nil {
+		ev.ReplyCh <- CommandResult{
+			Success: true,
+			Message: ev.Interpretation.Acknowledgement,
+			Data:    &taskCopy,
+		}
+	}
+
+	o.launchPlanWorkflow(workerCtx, ev.PlanID)
+}
+
+// ---------------------------------------------------------------------------
+// ADK Workflow DAG Compilation & Execution
+// ---------------------------------------------------------------------------
+
+var errTaskHalted = errors.New("task halted pending clarification or terminal failure")
+
+func (o *Orchestrator) launchPlanWorkflow(workerCtx context.Context, planID string) {
+	o.mu.Lock()
+	plan, ok := o.plans[planID]
+	if !ok || plan.Status == PlanStatusPaused {
+		o.mu.Unlock()
+		return
+	}
+	if prevCancel, exists := o.planCancels[planID]; exists {
+		prevCancel()
+	}
+	planCtx, cancel := context.WithCancel(workerCtx)
+	o.planCancels[planID] = cancel
+
+	wfAgent, err := o.buildPlanWorkflowAgentLocked(plan)
+	o.mu.Unlock()
+
+	if err != nil {
+		o.log.Error("failed to compile ADK workflow for plan", "plan_id", planID, "err", err)
+		return
+	}
+	if wfAgent == nil {
+		return // All tasks already completed
+	}
+
+	o.wg.Add(1)
+	go func() {
+		defer o.wg.Done()
+		defer func() {
+			o.mu.Lock()
+			delete(o.planCancels, planID)
+			if p, exists := o.plans[planID]; exists {
+				o.rollupPlanLocked(p)
+			}
+			o.mu.Unlock()
+			cancel()
+		}()
+
+		sessSvc := session.InMemoryService()
+		r, err := runner.New(runner.Config{
+			AppName:        "strix_workflow",
+			Agent:          wfAgent,
+			SessionService: sessSvc,
+		})
+		if err != nil {
+			o.log.Error("failed to create ADK workflow runner", "plan_id", planID, "err", err)
+			return
+		}
+
+		sessResp, err := sessSvc.Create(planCtx, &session.CreateRequest{
+			AppName: "strix_workflow",
+			UserID:  "orchestrator",
+		})
+		if err != nil {
+			o.log.Error("failed to create ADK workflow session", "plan_id", planID, "err", err)
+			return
+		}
+
+		trigger := genai.NewContentFromText("execute plan "+planID, genai.RoleUser)
+		for _, runErr := range r.Run(planCtx, "orchestrator", sessResp.Session.ID(), trigger, agent.RunConfig{}) {
+			if runErr != nil && !errors.Is(runErr, errTaskHalted) && !errors.Is(runErr, context.Canceled) {
+				o.log.Warn("ADK workflow execution yielded error", "plan_id", planID, "err", runErr)
+			}
+		}
+	}()
+}
+
+// buildPlanWorkflowAgentLocked compiles all non-completed tasks of a PlanNode
+// into a google.golang.org/adk/v2/workflow graph wrapped as a workflowagent.
+func (o *Orchestrator) buildPlanWorkflowAgentLocked(plan *PlanNode) (agent.Agent, error) {
+	allTasks := o.flattenTasksLocked(plan)
+	nodeMap := make(map[string]workflow.Node)
+
+	for _, t := range allTasks {
+		if t.Status == StatusCompleted || t.Status == StatusBlocked || t.Status == StatusAwaitingClarification || t.Status == StatusFailed {
+			continue
+		}
+		taskID := t.ID
+		planID := plan.ID
+		nodeMap[taskID] = workflow.NewDynamicNode[any, string](
+			taskID,
+			func(ctx agent.Context, _ any, _ func(*session.Event) error) (string, error) {
+				return o.executeTaskNode(ctx, planID, taskID)
+			},
+			workflow.NodeConfig{},
+		)
+	}
+
+	if len(nodeMap) == 0 {
+		return nil, nil
+	}
+
+	eb := workflow.NewEdgeBuilder()
+	for _, t := range allTasks {
+		node, included := nodeMap[t.ID]
+		if !included {
+			continue
+		}
+		wiredUpstream := false
+		for _, depID := range t.DependsOn {
+			if depNode, depInGraph := nodeMap[depID]; depInGraph {
+				eb.Add(depNode, node)
+				wiredUpstream = true
+			}
+		}
+		if !wiredUpstream {
+			eb.Add(workflow.Start, node)
+		}
+	}
+
+	return workflowagent.New(workflowagent.Config{
+		Name:        sanitizeWorkflowName(plan.ID),
+		Description: plan.Title,
+		Edges:       eb.Build(),
+	})
+}
+
+func sanitizeWorkflowName(id string) string {
+	var sb strings.Builder
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteRune('_')
+		}
+	}
+	res := sb.String()
+	if res == "" || (res[0] >= '0' && res[0] <= '9') {
+		return "wf_" + res
+	}
+	return res
+}
+
+// executeTaskNode runs a single leaf task inside an ADK workflow DynamicNode:
+// Execute -> LRM Review -> Tactical Retry -> Project Manager Triage (Split via workflow.RunNode / Clarify / Fail).
+func (o *Orchestrator) executeTaskNode(ctx agent.Context, planID, taskID string) (string, error) {
+	o.mu.Lock()
+	plan, ok := o.plans[planID]
+	if !ok || plan.Status == PlanStatusPaused {
+		o.mu.Unlock()
+		return "", errTaskHalted
+	}
+	task := o.findTaskLocked(plan, taskID)
+	if task == nil {
+		o.mu.Unlock()
+		return "", fmt.Errorf("task %s not found", taskID)
+	}
+	if task.Status == StatusCompleted {
+		out := task.Output
+		o.mu.Unlock()
+		return out, nil
+	}
+	if task.Status == StatusBlocked || task.Status == StatusAwaitingClarification || task.Status == StatusFailed {
+		o.mu.Unlock()
+		return "", errTaskHalted
+	}
+
+	handler, hasHandler := o.registry.Get(task.TaskType)
+	if !hasHandler {
+		task.Status = StatusFailed
+		task.LastError = fmt.Sprintf("missing handler for %s", task.TaskType)
+		o.blockTransitiveDependentsLocked(plan, task.ID)
+		o.rollupPlanLocked(plan)
+		o.mu.Unlock()
+		return "", errTaskHalted
+	}
+	maxAttempts := task.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = o.maxRetries
+	}
+	o.mu.Unlock()
+
+	var escalateReason string
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+
+		// 1. Prepare TaskInput and mark Running
+		o.mu.Lock()
+		if plan.Status == PlanStatusPaused {
+			o.mu.Unlock()
+			return "", errTaskHalted
+		}
+		task.Status = StatusRunning
+		task.Attempts++
+		attempt := task.Attempts
+		task.UpdatedAt = time.Now()
+		o.rollupPlanLocked(plan)
+
+		upstreamOutputs := make(map[string]string)
+		for _, depID := range task.DependsOn {
+			if dep := o.findTaskLocked(plan, depID); dep != nil {
+				upstreamOutputs[depID] = dep.Output
+			}
+		}
+		input := tasks.TaskInput{
+			TaskID:          task.ID,
+			Title:           task.Title,
+			Description:     task.Description,
+			TaskType:        task.TaskType,
+			Params:          task.Params,
+			UpstreamOutputs: upstreamOutputs,
+			Feedback:        append([]string(nil), task.FeedbackHistory...),
+			Clarifications:  append([]string(nil), task.Clarifications...),
+			Attempt:         attempt,
+		}
+		o.mu.Unlock()
+
+		o.log.Info("dispatching task to worker", "plan_id", planID, "task_id", taskID, "attempt", attempt)
+		output, execErr := handler.Execute(ctx, input)
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+
+		if execErr != nil {
+			o.log.Warn("task execution yielded error", "plan_id", planID, "task_id", taskID, "err", execErr)
+			o.mu.Lock()
+			task.LastError = execErr.Error()
+			task.UpdatedAt = time.Now()
+			o.mu.Unlock()
+
+			if attempt < maxAttempts {
+				continue
+			}
+			escalateReason = fmt.Sprintf("Worker execution error: %v", execErr)
+			break
+		}
+
+		// 2. Store output and invoke Reviewer Hat
+		o.mu.Lock()
+		task.Output = output.Content
+		task.Artifacts = output.Artifacts
+		task.Status = StatusReviewing
+		task.UpdatedAt = time.Now()
+		o.rollupPlanLocked(plan)
+
+		epic, story := o.findTaskParentsLocked(plan, task.ID)
+		reviewIn := llm.ReviewInput{
+			PlanObjective:  plan.Objective,
+			EpicTitle:      epic.Title,
+			StoryTitle:     story.Title,
+			Task:           o.taskToSpec(task),
+			Attempt:        attempt,
+			MaxAttempts:    maxAttempts,
+			Output:         task.Output,
+			PriorFeedback:  append([]string(nil), task.FeedbackHistory...),
+			Clarifications: append([]string(nil), task.Clarifications...),
+		}
+		o.mu.Unlock()
+
+		verdict, revErr := o.lrm.Review(ctx, reviewIn)
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if revErr != nil {
+			o.log.Error("reviewer hat encountered error", "plan_id", planID, "task_id", taskID, "err", revErr)
+			o.mu.Lock()
+			task.LastError = "Review error: " + revErr.Error()
+			o.mu.Unlock()
+			if attempt < maxAttempts {
+				continue
+			}
+			escalateReason = fmt.Sprintf("Reviewer error: %v", revErr)
+			break
+		}
+
+		o.mu.Lock()
+		task.LastScore = verdict.Score
+		if verdict.Approved {
+			task.Status = StatusCompleted
+			task.UpdatedAt = time.Now()
+			o.rollupPlanLocked(plan)
+			finalOut := task.Output
+			o.mu.Unlock()
+			o.log.Info("task passed review", "plan_id", planID, "task_id", taskID, "score", verdict.Score)
+			return finalOut, nil
+		}
+
+		if verdict.Feedback != "" {
+			task.FeedbackHistory = append(task.FeedbackHistory, verdict.Feedback)
+		}
+		task.UpdatedAt = time.Now()
+		o.mu.Unlock()
+
+		o.log.Warn("task rejected by reviewer", "plan_id", planID, "task_id", taskID,
+			"needs_clarification", verdict.NeedsClarification, "feedback", verdict.Feedback)
+
+		if verdict.NeedsClarification {
+			escalateReason = "needs_clarification"
+			break
+		}
+		if attempt < maxAttempts {
+			o.log.Info("scheduling tactical retry", "plan_id", planID, "task_id", taskID, "next_attempt", attempt+1)
+			continue
+		}
+		o.log.Warn("max retries exhausted, escalating to Project Manager", "plan_id", planID, "task_id", taskID)
+		escalateReason = fmt.Sprintf("Exhausted %d attempts. Last feedback: %s", attempt, verdict.Feedback)
+		break
+	}
+
+	// 3. Strategic Escalation: Project Manager Triage (directly in-node, no channel self-send)
+	return o.triageAndRemediate(ctx, plan, task, escalateReason)
+}
+
+func (o *Orchestrator) triageAndRemediate(ctx agent.Context, plan *PlanNode, task *TaskNode, reason string) (string, error) {
+	o.mu.RLock()
+	epic, story := o.findTaskParentsLocked(plan, task.ID)
+	allTasks := o.flattenTasksLocked(plan)
+	existingIDs := make([]string, 0, len(allTasks))
+	for _, t := range allTasks {
+		existingIDs = append(existingIDs, t.ID)
+	}
+	caps := o.registry.Capabilities()
+	capList := make([]llm.Capability, 0, len(caps))
+	for k, desc := range caps {
+		capList = append(capList, llm.Capability{TaskType: k, Description: desc})
+	}
+	triageIn := llm.TriageInput{
+		PlanObjective:   plan.Objective,
+		EpicTitle:       epic.Title,
+		StoryTitle:      story.Title,
+		Task:            o.taskToSpec(task),
+		Reason:          reason,
+		Attempts:        task.Attempts,
+		MaxAttempts:     task.MaxAttempts,
+		Feedback:        append([]string(nil), task.FeedbackHistory...),
+		LastOutput:      task.Output,
+		LastError:       task.LastError,
+		CanSplit:        !strings.Contains(task.ID, ".s"),
+		Capabilities:    capList,
+		ExistingTaskIDs: existingIDs,
+		Clarifications:  append([]string(nil), task.Clarifications...),
+	}
+	o.mu.RUnlock()
+
+	remediation, err := o.lrm.Triage(ctx, triageIn)
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if err != nil {
+		o.log.Error("project manager triage error, pausing for clarification", "err", err)
+		o.mu.Lock()
+		task.Status = StatusAwaitingClarification
+		task.PendingQuestion = "The task repeatedly failed and automated triage failed. Please provide guidance."
+		o.blockTransitiveDependentsLocked(plan, task.ID)
+		o.rollupPlanLocked(plan)
+		o.mu.Unlock()
+		return "", errTaskHalted
+	}
+
+	o.log.Info("project manager returned remediation", "action", remediation.Action, "rationale", remediation.Rationale)
+
+	switch remediation.Action {
+	case llm.ActionSplit:
+		subNodes, err := o.spliceSubTasks(plan, task, remediation.SubTasks)
+		if err != nil {
+			o.log.Warn("sub-task splicing failed, falling back to clarification", "err", err)
+			o.mu.Lock()
+			task.Status = StatusAwaitingClarification
+			task.PendingExplanation = "Failed to decompose task: " + err.Error()
+			task.PendingQuestion = "Please provide clarifying instructions for this task."
+			o.blockTransitiveDependentsLocked(plan, task.ID)
+			o.rollupPlanLocked(plan)
+			o.mu.Unlock()
+			return "", errTaskHalted
+		}
+
+		// Execute spliced sub-tasks in topological order via ADK workflow.RunNode
+		var combinedOut strings.Builder
+		for _, sub := range subNodes {
+			subID := sub.ID
+			childNode := workflow.NewDynamicNode[any, string](
+				subID,
+				func(childCtx agent.Context, _ any, _ func(*session.Event) error) (string, error) {
+					return o.executeTaskNode(childCtx, plan.ID, subID)
+				},
+				workflow.NodeConfig{},
+			)
+			subOut, runErr := workflow.RunNode[string](ctx, childNode, nil)
+			if runErr != nil {
+				return "", runErr
+			}
+			if combinedOut.Len() > 0 {
+				combinedOut.WriteString("\n\n")
+			}
+			combinedOut.WriteString(subOut)
+		}
+
+		o.mu.Lock()
+		task.Output = combinedOut.String()
+		task.Status = StatusCompleted
+		task.UpdatedAt = time.Now()
+		o.rollupPlanLocked(plan)
+		o.mu.Unlock()
+		o.log.Info("join node completed automatically", "plan_id", plan.ID, "task_id", task.ID)
+		return combinedOut.String(), nil
+
+	case llm.ActionClarify:
+		o.mu.Lock()
+		task.Status = StatusAwaitingClarification
+		task.PendingExplanation = remediation.Explanation
+		task.PendingQuestion = remediation.Question
+		task.UpdatedAt = time.Now()
+		o.blockTransitiveDependentsLocked(plan, task.ID)
+		o.rollupPlanLocked(plan)
+		o.mu.Unlock()
+		return "", errTaskHalted
+
+	default: // ActionFail
+		o.mu.Lock()
+		task.Status = StatusFailed
+		task.LastError = remediation.Explanation
+		task.UpdatedAt = time.Now()
+		o.blockTransitiveDependentsLocked(plan, task.ID)
+		o.rollupPlanLocked(plan)
+		o.mu.Unlock()
+		return "", errTaskHalted
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic Sub-Task Splicing (Atomic Validation Before Mutation)
+// ---------------------------------------------------------------------------
+
+func (o *Orchestrator) spliceSubTasks(plan *PlanNode, task *TaskNode, subTasks []llm.TaskSpec) ([]*TaskNode, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	_, story := o.findTaskParentsLocked(plan, task.ID)
+	if story == nil {
+		return nil, fmt.Errorf("parent story for task %s not found", task.ID)
+	}
+
+	idPrefix := task.ID + "."
+	localMap := make(map[string]string, len(subTasks))
+	for _, sub := range subTasks {
+		localMap[sub.ID] = idPrefix + sub.ID
+	}
+
+	now := time.Now()
+	newNodes := make([]*TaskNode, 0, len(subTasks))
+	isTargetedBySibling := make(map[string]bool)
+
+	for _, sub := range subTasks {
+		newID := localMap[sub.ID]
+		var mappedDeps []string
+		for _, d := range sub.DependsOn {
+			if target, ok := localMap[d]; ok {
+				mappedDeps = append(mappedDeps, target)
+				isTargetedBySibling[target] = true
+			} else {
+				mappedDeps = append(mappedDeps, d)
+			}
+		}
+		if len(mappedDeps) == 0 {
+			mappedDeps = append([]string(nil), task.DependsOn...)
+		}
+
+		newNodes = append(newNodes, &TaskNode{
+			ID:                 newID,
+			Title:              sub.Title,
+			Description:        sub.Description,
+			TaskType:           sub.TaskType,
+			DependsOn:          mappedDeps,
+			AcceptanceCriteria: append([]string(nil), sub.AcceptanceCriteria...),
+			Params:             sub.Params,
+			Status:             StatusPending,
+			MaxAttempts:        o.maxRetries,
+			Artifacts:          make(map[string]string),
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		})
+	}
+
+	terminalSubIDs := make([]string, 0, len(newNodes))
+	for _, n := range newNodes {
+		if !isTargetedBySibling[n.ID] {
+			terminalSubIDs = append(terminalSubIDs, n.ID)
+		}
+	}
+	if len(terminalSubIDs) == 0 {
+		for _, n := range newNodes {
+			terminalSubIDs = append(terminalSubIDs, n.ID)
+		}
+	}
+
+	// Snapshot original task state for full atomic rollback on validation failure
+	origDeps := append([]string(nil), task.DependsOn...)
+	origStatus := task.Status
+	origLen := len(story.Tasks)
+
+	story.Tasks = append(story.Tasks, newNodes...)
+	task.IsJoinNode = true
+	task.SubTaskIDs = make([]string, 0, len(newNodes))
+	for _, n := range newNodes {
+		task.SubTaskIDs = append(task.SubTaskIDs, n.ID)
+	}
+	task.DependsOn = terminalSubIDs
+	task.Status = StatusPending
+	task.UpdatedAt = now
+
+	sortedIDs, err := ValidatePlanSpec(o.planToSpecLocked(plan), o.registry)
+	if err != nil {
+		// Full rollback: restore story tasks, DependsOn, Status, IsJoinNode, SubTaskIDs
+		story.Tasks = story.Tasks[:origLen]
+		task.IsJoinNode = false
+		task.SubTaskIDs = nil
+		task.DependsOn = origDeps
+		task.Status = origStatus
+		return nil, fmt.Errorf("spliced plan DAG invalid: %w", err)
+	}
+
+	// Return spliced sub-nodes in validated topological order
+	nodeByID := make(map[string]*TaskNode, len(newNodes))
+	for _, n := range newNodes {
+		nodeByID[n.ID] = n
+	}
+	ordered := make([]*TaskNode, 0, len(newNodes))
+	for _, id := range sortedIDs {
+		if n, ok := nodeByID[id]; ok {
+			ordered = append(ordered, n)
+		}
+	}
+
+	o.log.Info("successfully spliced sub-tasks into DAG", "original_task", task.ID, "sub_tasks_count", len(ordered))
+	return ordered, nil
+}
+
+// ---------------------------------------------------------------------------
+// Tree Construction, Rollups & Helpers (All *Locked require o.mu held)
+// ---------------------------------------------------------------------------
 
 func (o *Orchestrator) createPlanNode(spec llm.PlanSpec) *PlanNode {
 	now := time.Now()
@@ -423,523 +1053,19 @@ func (o *Orchestrator) createPlanNode(spec llm.PlanSpec) *PlanNode {
 	return p
 }
 
-// ---------------------------------------------------------------------------
-// DAG Evaluation and Asynchronous Task Dispatch
-// ---------------------------------------------------------------------------
-
-func (o *Orchestrator) evaluateAndDispatch(ctx context.Context, plan *PlanNode) {
-	if plan.Status == PlanStatusPaused {
-		o.log.Info("plan is paused, skipping task dispatch", "plan_id", plan.ID)
-		return
-	}
-
-	allTasks := o.flattenTasks(plan)
-	taskMap := make(map[string]*TaskNode, len(allTasks))
-	for _, t := range allTasks {
-		taskMap[t.ID] = t
-	}
-
-	var toDispatch []*TaskNode
-
-	for _, task := range allTasks {
-		if task.Status != StatusPending {
-			continue
-		}
-
-		// Check if all upstream dependencies are Completed
-		depsSatisfied := true
-		for _, depID := range task.DependsOn {
-			depTask, exists := taskMap[depID]
-			if !exists || depTask.Status != StatusCompleted {
-				depsSatisfied = false
-				break
-			}
-		}
-
-		if depsSatisfied {
-			if task.IsJoinNode {
-				// Join nodes complete automatically once their child sub-tasks finish
-				task.Status = StatusCompleted
-				task.UpdatedAt = time.Now()
-				o.log.Info("join node completed automatically", "plan_id", plan.ID, "task_id", task.ID)
-			} else {
-				task.Status = StatusReady
-				task.UpdatedAt = time.Now()
-				toDispatch = append(toDispatch, task)
-			}
-		}
-	}
-
-	o.rollupPlan(plan)
-
-	for _, task := range toDispatch {
-		o.dispatchTask(ctx, plan, task, taskMap)
-	}
-}
-
-func (o *Orchestrator) dispatchTask(
-	ctx context.Context,
-	plan *PlanNode,
-	task *TaskNode,
-	taskMap map[string]*TaskNode,
-) {
-	handler, ok := o.registry.Get(task.TaskType)
-	if !ok {
-		o.log.Error("no handler found for task type", "task_id", task.ID, "type", task.TaskType)
-		task.Status = StatusFailed
-		task.LastError = fmt.Sprintf("missing handler for %s", task.TaskType)
-		o.rollupPlan(plan)
-		return
-	}
-
-	task.Status = StatusRunning
-	task.Attempts++
-	task.UpdatedAt = time.Now()
-	o.rollupPlan(plan)
-
-	// Collect outputs of direct upstream dependencies
-	upstreamOutputs := make(map[string]string)
-	for _, depID := range task.DependsOn {
-		if dep, exists := taskMap[depID]; exists {
-			upstreamOutputs[depID] = dep.Output
-		}
-	}
-
-	input := tasks.TaskInput{
-		TaskID:          task.ID,
-		Title:           task.Title,
-		Description:     task.Description,
-		TaskType:        task.TaskType,
-		Params:          task.Params,
-		UpstreamOutputs: upstreamOutputs,
-		Feedback:        append([]string(nil), task.FeedbackHistory...),
-		Clarifications:  append([]string(nil), task.Clarifications...),
-		Attempt:         task.Attempts,
-	}
-
-	planID := plan.ID
-	taskID := task.ID
-	attempt := task.Attempts
-
-	o.wg.Add(1)
-	go func() {
-		defer o.wg.Done()
-		o.log.Info("dispatching task to worker", "plan_id", planID, "task_id", taskID, "attempt", attempt)
-
-		output, err := handler.Execute(ctx, input)
-		if ctx.Err() != nil {
-			return // Context canceled during shutdown
-		}
-
-		o.eventCh <- TaskExecutionResultEvent{
-			PlanID:  planID,
-			TaskID:  taskID,
-			Output:  output,
-			Err:     err,
-			Attempt: attempt,
-		}
-	}()
-}
-
-// ---------------------------------------------------------------------------
-// Execution, Review, and Escalation Handlers
-// ---------------------------------------------------------------------------
-
-func (o *Orchestrator) handleTaskExecutionResult(ctx context.Context, ev TaskExecutionResultEvent) {
-	plan, ok := o.plans[ev.PlanID]
-	if !ok {
-		return
-	}
-	task := o.findTask(plan, ev.TaskID)
-	if task == nil || task.Status != StatusRunning {
-		return
-	}
-
-	if ev.Err != nil {
-		o.log.Warn("task execution yielded error", "plan_id", ev.PlanID, "task_id", ev.TaskID, "err", ev.Err)
-		task.LastError = ev.Err.Error()
-		if task.Attempts < task.MaxAttempts {
-			// Tactical retry
-			task.Status = StatusPending
-			o.evaluateAndDispatch(ctx, plan)
-		} else {
-			// Strategic escalation to Project Manager
-			o.eventCh <- TaskEscalatedEvent{
-				PlanID:   ev.PlanID,
-				TaskID:   ev.TaskID,
-				Reason:   fmt.Sprintf("Worker execution error: %v", ev.Err),
-				Attempts: task.Attempts,
-			}
-		}
-		return
-	}
-
-	// Execution succeeded: store output and dispatch for Review
-	task.Output = ev.Output.Content
-	task.Artifacts = ev.Output.Artifacts
-	task.Status = StatusReviewing
-	task.UpdatedAt = time.Now()
-	o.rollupPlan(plan)
-
-	// Async Reviewer Hat call
-	epic, story := o.findTaskParents(plan, task.ID)
-	reviewIn := llm.ReviewInput{
-		PlanObjective:  plan.Objective,
-		EpicTitle:      epic.Title,
-		StoryTitle:     story.Title,
-		Task:           o.taskToSpec(task),
-		Attempt:        task.Attempts,
-		MaxAttempts:    task.MaxAttempts,
-		Output:         task.Output,
-		PriorFeedback:  append([]string(nil), task.FeedbackHistory...),
-		Clarifications: append([]string(nil), task.Clarifications...),
-	}
-
-	o.wg.Add(1)
-	go func() {
-		defer o.wg.Done()
-		verdict, err := o.lrm.Review(ctx, reviewIn)
-		if ctx.Err() != nil {
-			return
-		}
-		o.eventCh <- TaskReviewResultEvent{
-			PlanID:  ev.PlanID,
-			TaskID:  ev.TaskID,
-			Verdict: verdict,
-			Err:     err,
-			Attempt: ev.Attempt,
-		}
-	}()
-}
-
-func (o *Orchestrator) handleTaskReviewResult(ctx context.Context, ev TaskReviewResultEvent) {
-	plan, ok := o.plans[ev.PlanID]
-	if !ok {
-		return
-	}
-	task := o.findTask(plan, ev.TaskID)
-	if task == nil || task.Status != StatusReviewing {
-		return
-	}
-
-	if ev.Err != nil {
-		o.log.Error("reviewer hat encountered error", "plan_id", ev.PlanID, "task_id", ev.TaskID, "err", ev.Err)
-		task.LastError = "Review error: " + ev.Err.Error()
-		task.Status = StatusPending
-		o.evaluateAndDispatch(ctx, plan)
-		return
-	}
-
-	task.LastScore = ev.Verdict.Score
-
-	if ev.Verdict.Approved {
-		o.log.Info("task passed review", "plan_id", ev.PlanID, "task_id", ev.TaskID, "score", ev.Verdict.Score)
-		task.Status = StatusCompleted
-		task.UpdatedAt = time.Now()
-		o.evaluateAndDispatch(ctx, plan)
-		return
-	}
-
-	// Rejected by Reviewer
-	o.log.Warn("task rejected by reviewer", "plan_id", ev.PlanID, "task_id", ev.TaskID,
-		"needs_clarification", ev.Verdict.NeedsClarification, "feedback", ev.Verdict.Feedback)
-
-	if ev.Verdict.Feedback != "" {
-		task.FeedbackHistory = append(task.FeedbackHistory, ev.Verdict.Feedback)
-	}
-
-	if ev.Verdict.NeedsClarification {
-		// Needs Clarification immediately triggers strategic escalation
-		o.eventCh <- TaskEscalatedEvent{
-			PlanID:   ev.PlanID,
-			TaskID:   ev.TaskID,
-			Reason:   "needs_clarification",
-			Attempts: task.Attempts,
-		}
-		return
-	}
-
-	// Tactical Retry vs Strategic Escalation
-	if task.Attempts < task.MaxAttempts {
-		o.log.Info("scheduling tactical retry", "plan_id", ev.PlanID, "task_id", ev.TaskID, "next_attempt", task.Attempts+1)
-		task.Status = StatusPending
-		o.evaluateAndDispatch(ctx, plan)
-	} else {
-		o.log.Warn("max retries exhausted, escalating to Project Manager", "plan_id", ev.PlanID, "task_id", ev.TaskID)
-		o.eventCh <- TaskEscalatedEvent{
-			PlanID:   ev.PlanID,
-			TaskID:   ev.TaskID,
-			Reason:   fmt.Sprintf("Exhausted %d attempts. Last feedback: %s", task.Attempts, ev.Verdict.Feedback),
-			Attempts: task.Attempts,
-		}
-	}
-}
-
-func (o *Orchestrator) handleTaskEscalated(ctx context.Context, ev TaskEscalatedEvent) {
-	plan, ok := o.plans[ev.PlanID]
-	if !ok {
-		return
-	}
-	task := o.findTask(plan, ev.TaskID)
-	if task == nil {
-		return
-	}
-
-	epic, story := o.findTaskParents(plan, task.ID)
-	allTasks := o.flattenTasks(plan)
-	existingIDs := make([]string, 0, len(allTasks))
-	for _, t := range allTasks {
-		existingIDs = append(existingIDs, t.ID)
-	}
-
-	caps := o.registry.Capabilities()
-	capList := make([]llm.Capability, 0, len(caps))
-	for k, desc := range caps {
-		capList = append(capList, llm.Capability{TaskType: k, Description: desc})
-	}
-
-	canSplit := !strings.Contains(task.ID, ".s") // Don't split infinitely deep sub-tasks
-
-	triageIn := llm.TriageInput{
-		PlanObjective:   plan.Objective,
-		EpicTitle:       epic.Title,
-		StoryTitle:      story.Title,
-		Task:            o.taskToSpec(task),
-		Reason:          ev.Reason,
-		Attempts:        ev.Attempts,
-		MaxAttempts:     task.MaxAttempts,
-		Feedback:        append([]string(nil), task.FeedbackHistory...),
-		LastOutput:      task.Output,
-		LastError:       task.LastError,
-		CanSplit:        canSplit,
-		Capabilities:    capList,
-		ExistingTaskIDs: existingIDs,
-		Clarifications:  append([]string(nil), task.Clarifications...),
-	}
-
-	o.wg.Add(1)
-	go func() {
-		defer o.wg.Done()
-		remediation, err := o.lrm.Triage(ctx, triageIn)
-		if ctx.Err() != nil {
-			return
-		}
-		o.eventCh <- RemediationResultEvent{
-			PlanID:      ev.PlanID,
-			TaskID:      ev.TaskID,
-			Remediation: remediation,
-			Err:         err,
-		}
-	}()
-}
-
-func (o *Orchestrator) handleRemediationResult(ctx context.Context, ev RemediationResultEvent) {
-	plan, ok := o.plans[ev.PlanID]
-	if !ok {
-		return
-	}
-	task := o.findTask(plan, ev.TaskID)
-	if task == nil {
-		return
-	}
-
-	if ev.Err != nil {
-		o.log.Error("project manager triage error, pausing for clarification", "err", ev.Err)
-		task.Status = StatusAwaitingClarification
-		task.PendingQuestion = "The task repeatedly failed and automated triage failed. Please provide guidance."
-		o.blockTransitiveDependents(plan, task.ID)
-		o.rollupPlan(plan)
-		return
-	}
-
-	o.log.Info("project manager returned remediation", "action", ev.Remediation.Action, "rationale", ev.Remediation.Rationale)
-
-	switch ev.Remediation.Action {
-	case llm.ActionSplit:
-		if err := o.spliceSubTasks(plan, task, ev.Remediation.SubTasks); err != nil {
-			o.log.Warn("sub-task splicing failed, falling back to clarification", "err", err)
-			task.Status = StatusAwaitingClarification
-			task.PendingExplanation = "Failed to decompose task: " + err.Error()
-			task.PendingQuestion = "Please provide clarifying instructions for this task."
-			o.blockTransitiveDependents(plan, task.ID)
-		} else {
-			o.evaluateAndDispatch(ctx, plan)
-		}
-
-	case llm.ActionClarify:
-		task.Status = StatusAwaitingClarification
-		task.PendingExplanation = ev.Remediation.Explanation
-		task.PendingQuestion = ev.Remediation.Question
-		task.UpdatedAt = time.Now()
-		o.blockTransitiveDependents(plan, task.ID)
-		o.rollupPlan(plan)
-
-	case llm.ActionFail:
-		task.Status = StatusFailed
-		task.LastError = ev.Remediation.Explanation
-		task.UpdatedAt = time.Now()
-		o.blockTransitiveDependents(plan, task.ID)
-		o.rollupPlan(plan)
-	}
-}
-
-func (o *Orchestrator) handleClarificationResolved(ctx context.Context, ev ClarificationResolvedEvent) {
-	plan, ok := o.plans[ev.PlanID]
-	if !ok {
-		if ev.ReplyCh != nil {
-			ev.ReplyCh <- CommandResult{Success: false, Message: "plan not found"}
-		}
-		return
-	}
-	task := o.findTask(plan, ev.TaskID)
-	if task == nil {
-		if ev.ReplyCh != nil {
-			ev.ReplyCh <- CommandResult{Success: false, Message: "task not found"}
-		}
-		return
-	}
-
-	o.log.Info("applying clarification to paused task", "plan_id", ev.PlanID, "task_id", ev.TaskID)
-
-	task.Description = ev.Interpretation.AmendedDescription
-	task.AcceptanceCriteria = append(task.AcceptanceCriteria, ev.Interpretation.AdditionalAcceptanceCriteria...)
-	task.Clarifications = append(task.Clarifications, ev.Answer)
-	task.PendingExplanation = ""
-	task.PendingQuestion = ""
-	task.Attempts = 0
-	task.Status = StatusPending
-	task.UpdatedAt = time.Now()
-
-	// Unblock downstream dependents so they can execute once this task completes
-	downstreamMap, _ := BuildAdjacencyLists(plan)
-	dependents := FindTransitiveDependents(task.ID, downstreamMap)
-	for _, depID := range dependents {
-		if dep := o.findTask(plan, depID); dep != nil && dep.Status == StatusBlocked {
-			dep.Status = StatusPending
-			dep.UpdatedAt = time.Now()
-		}
-	}
-
-	o.evaluateAndDispatch(ctx, plan)
-
-	if ev.ReplyCh != nil {
-		ev.ReplyCh <- CommandResult{
-			Success: true,
-			Message: ev.Interpretation.Acknowledgement,
-			Data:    task,
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Dynamic Sub-Task Splicing
-// ---------------------------------------------------------------------------
-
-func (o *Orchestrator) spliceSubTasks(plan *PlanNode, task *TaskNode, subTasks []llm.TaskSpec) error {
-	_, story := o.findTaskParents(plan, task.ID)
-	if story == nil {
-		return fmt.Errorf("parent story for task %s not found", task.ID)
-	}
-
-	idPrefix := task.ID + "."
-	localMap := make(map[string]string)
-	for _, sub := range subTasks {
-		localMap[sub.ID] = idPrefix + sub.ID
-	}
-
-	now := time.Now()
-	var newNodes []*TaskNode
-	terminalSubIDs := make([]string, 0, len(subTasks))
-	isTargetedBySibling := make(map[string]bool)
-
-	for _, sub := range subTasks {
-		newID := localMap[sub.ID]
-		var mappedDeps []string
-		for _, d := range sub.DependsOn {
-			if target, ok := localMap[d]; ok {
-				mappedDeps = append(mappedDeps, target)
-				isTargetedBySibling[target] = true
-			} else {
-				mappedDeps = append(mappedDeps, d)
-			}
-		}
-		if len(mappedDeps) == 0 {
-			// Inherit original task's upstream dependencies
-			mappedDeps = append([]string(nil), task.DependsOn...)
-		}
-
-		node := &TaskNode{
-			ID:                 newID,
-			Title:              sub.Title,
-			Description:        sub.Description,
-			TaskType:           sub.TaskType,
-			DependsOn:          mappedDeps,
-			AcceptanceCriteria: append([]string(nil), sub.AcceptanceCriteria...),
-			Params:             sub.Params,
-			Status:             StatusPending,
-			MaxAttempts:        o.maxRetries,
-			Artifacts:          make(map[string]string),
-			CreatedAt:          now,
-			UpdatedAt:          now,
-		}
-		newNodes = append(newNodes, node)
-	}
-
-	for _, n := range newNodes {
-		if !isTargetedBySibling[n.ID] {
-			terminalSubIDs = append(terminalSubIDs, n.ID)
-		}
-	}
-	if len(terminalSubIDs) == 0 {
-		for _, n := range newNodes {
-			terminalSubIDs = append(terminalSubIDs, n.ID)
-		}
-	}
-
-	// Splice new nodes into story
-	story.Tasks = append(story.Tasks, newNodes...)
-
-	// Configure original task as join node
-	task.IsJoinNode = true
-	task.SubTaskIDs = make([]string, 0, len(newNodes))
-	for _, n := range newNodes {
-		task.SubTaskIDs = append(task.SubTaskIDs, n.ID)
-	}
-	task.DependsOn = terminalSubIDs
-	task.Status = StatusPending
-	task.UpdatedAt = now
-
-	// Validate resulting DAG
-	spec := o.planToSpec(plan)
-	if _, err := ValidatePlanSpec(spec, o.registry); err != nil {
-		// Roll back on validation failure
-		story.Tasks = story.Tasks[:len(story.Tasks)-len(newNodes)]
-		task.IsJoinNode = false
-		task.SubTaskIDs = nil
-		return fmt.Errorf("spliced plan DAG invalid: %w", err)
-	}
-
-	o.log.Info("successfully spliced sub-tasks into DAG", "original_task", task.ID, "sub_tasks_count", len(newNodes))
-	return nil
-}
-
-func (o *Orchestrator) blockTransitiveDependents(plan *PlanNode, rootTaskID string) {
+func (o *Orchestrator) blockTransitiveDependentsLocked(plan *PlanNode, rootTaskID string) {
 	downstreamMap, _ := BuildAdjacencyLists(plan)
 	dependents := FindTransitiveDependents(rootTaskID, downstreamMap)
 	now := time.Now()
 	for _, depID := range dependents {
-		if dep := o.findTask(plan, depID); dep != nil {
+		if dep := o.findTaskLocked(plan, depID); dep != nil {
 			dep.Status = StatusBlocked
 			dep.UpdatedAt = now
 		}
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Status Rollups and Helpers
-// ---------------------------------------------------------------------------
-
-func (o *Orchestrator) rollupPlan(plan *PlanNode) {
+func (o *Orchestrator) rollupPlanLocked(plan *PlanNode) {
 	if plan.Status == PlanStatusPaused {
 		plan.UpdatedAt = time.Now()
 		return
@@ -1029,7 +1155,7 @@ func epicNodesToStatuses(epics []*EpicNode) []string {
 	return res
 }
 
-func (o *Orchestrator) flattenTasks(plan *PlanNode) []*TaskNode {
+func (o *Orchestrator) flattenTasksLocked(plan *PlanNode) []*TaskNode {
 	var list []*TaskNode
 	for _, e := range plan.Epics {
 		for _, s := range e.Stories {
@@ -1039,7 +1165,7 @@ func (o *Orchestrator) flattenTasks(plan *PlanNode) []*TaskNode {
 	return list
 }
 
-func (o *Orchestrator) findTask(plan *PlanNode, taskID string) *TaskNode {
+func (o *Orchestrator) findTaskLocked(plan *PlanNode, taskID string) *TaskNode {
 	for _, e := range plan.Epics {
 		for _, s := range e.Stories {
 			for _, t := range s.Tasks {
@@ -1052,7 +1178,7 @@ func (o *Orchestrator) findTask(plan *PlanNode, taskID string) *TaskNode {
 	return nil
 }
 
-func (o *Orchestrator) findTaskParents(plan *PlanNode, taskID string) (*EpicNode, *StoryNode) {
+func (o *Orchestrator) findTaskParentsLocked(plan *PlanNode, taskID string) (*EpicNode, *StoryNode) {
 	for _, e := range plan.Epics {
 		for _, s := range e.Stories {
 			for _, t := range s.Tasks {
@@ -1077,7 +1203,7 @@ func (o *Orchestrator) taskToSpec(t *TaskNode) llm.TaskSpec {
 	}
 }
 
-func (o *Orchestrator) planToSpec(p *PlanNode) llm.PlanSpec {
+func (o *Orchestrator) planToSpecLocked(p *PlanNode) llm.PlanSpec {
 	spec := llm.PlanSpec{
 		ID:        p.ID,
 		Title:     p.Title,
@@ -1105,7 +1231,7 @@ func (o *Orchestrator) planToSpec(p *PlanNode) llm.PlanSpec {
 	return spec
 }
 
-func (o *Orchestrator) formatSystemStateSummary() string {
+func (o *Orchestrator) formatSystemStateSummaryLocked() string {
 	if len(o.plans) == 0 && len(o.draftPlans) == 0 {
 		return "No plans currently tracked in the engine."
 	}
@@ -1144,4 +1270,3 @@ func clonePlan(p *PlanNode) *PlanNode {
 	_ = json.Unmarshal(data, &cloned)
 	return &cloned
 }
-

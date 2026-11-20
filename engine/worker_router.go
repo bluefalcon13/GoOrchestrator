@@ -176,10 +176,16 @@ func (r *WorkerRouter) SelectWorker(estimatedTokens int, requiredTags ...string)
 	}
 
 	// Priority heuristics:
-	// 1. If small prompt (<= 8192) and NPU available, prefer NPU (energy & bandwidth efficient)
-	// 2. Otherwise prefer worker with lowest active jobs / least utilized
+	// 1. Prefer workers with available concurrency headroom over saturated ("busy") workers
+	// 2. If small prompt (<= 8192) and NPU has capacity, prefer NPU (energy & bandwidth efficient)
+	// 3. Otherwise prefer worker with lowest active jobs / least utilized
 	sort.Slice(candidates, func(i, j int) bool {
 		cA, cB := candidates[i], candidates[j]
+		availA := cA.ActiveJobs < cA.Concurrency
+		availB := cB.ActiveJobs < cB.Concurrency
+		if availA != availB {
+			return availA
+		}
 		if estimatedTokens <= 8192 {
 			if cA.Type == "npu" && cB.Type != "npu" {
 				return true
@@ -262,6 +268,15 @@ func (r *WorkerRouter) Complete(ctx context.Context, req llm.CompletionRequest) 
 		}
 		return llm.CompletionResponse{}, err
 	}
+	tokensUsed := int64(resp.Usage.TotalTokens)
+	if tokensUsed <= 0 {
+		tokensUsed = int64(totalTokens + estimateTokens(resp.Content))
+	}
+	r.mu.Lock()
+	if node, exists := r.workers[worker.ID]; exists {
+		node.TotalTokens += tokensUsed
+	}
+	r.mu.Unlock()
 	return resp, nil
 }
 

@@ -13,11 +13,16 @@ import (
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model/openaimodel"
+	"google.golang.org/adk/v2/plugin"
+	"google.golang.org/adk/v2/plugin/retryandreflect"
+	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/server/adkrest"
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/session/compaction"
 
 	orchagent "go-orchestrator/agent"
 	"go-orchestrator/engine"
+	"go-orchestrator/gateway"
 	"go-orchestrator/llm"
 	"go-orchestrator/rag"
 	"go-orchestrator/tasks"
@@ -39,6 +44,7 @@ func main() {
 
 	// 1. Model Backend via ADK OpenAI Connector (Points to vLLM on :8000)
 	lrmModel, err := openaimodel.NewModel(ctx, "default", &openaimodel.ClientConfig{
+		APIKey:  "local", // Prevents fallback to host OPENAI_API_KEY env var
 		BaseURL: *lrmURL + "/v1",
 		API:     openaimodel.APIChatCompletions,
 	})
@@ -89,7 +95,7 @@ func main() {
 	registry.Register("query", ragSearchH)
 	registry.Register("search", ragSearchH)
 
-	lrmClient := llm.NewClient(*lrmURL, llm.WithMode(llm.ModeHTTP))
+	lrmClient := llm.NewADKClient(lrmModel)
 	lrm := llm.NewLRMPersonaEngine(lrmClient)
 
 	eventCh := make(chan any, 256)
@@ -106,6 +112,7 @@ func main() {
 		EventCh:      eventCh,
 		WorkerRouter: workerRouter,
 		RAGClient:    ragClient,
+		Registry:     registry,
 	}
 	tools, err := orchagent.BuildTools(oCtx)
 	if err != nil {
@@ -117,11 +124,21 @@ func main() {
 		log.Fatalf("Failed to create root ADK agent: %v", err)
 	}
 
-	// 6. ADK REST & Streaming SSE Server (Replaces ~600 lines of custom API server)
+	// 6. ADK REST & Streaming SSE Server with Qdrant Memory, Context Compaction & Retry-and-Reflect Plugin
 	restServer, err := adkrest.NewServer(adkrest.ServerConfig{
 		AgentLoader:     agent.NewSingleLoader(rootAgent),
 		SessionService:  session.InMemoryService(),
+		MemoryService:   rag.NewADKMemoryService(ragClient, "default_corpus"),
 		SSEWriteTimeout: 120 * time.Second,
+		Compaction: &compaction.Config{
+			TokenThreshold:     32000,
+			EventRetentionSize: 10,
+		},
+		PluginConfig: runner.PluginConfig{
+			Plugins: []*plugin.Plugin{
+				retryandreflect.MustNew(retryandreflect.WithMaxRetries(2)),
+			},
+		},
 	})
 	if err != nil {
 		log.Fatalf("Failed to create ADK REST server: %v", err)
@@ -138,6 +155,99 @@ func main() {
 	// MCP SSE Server for VS Code Continue
 	mcpServer := orchagent.NewMCPServer(oCtx)
 	mcpServer.RegisterRoutes(mux)
+
+	// OpenAI-Compatible Smart Gateway Proxy (Protects context window from large file pastes)
+	gw, err := gateway.NewProxyGateway(gateway.GatewayConfig{
+		TargetBaseURL:  *lrmURL,
+		DataDir:        "/data",
+		MaxInlineBytes: 16 * 1024,
+	})
+	if err != nil {
+		log.Fatalf("Failed to initialize gateway proxy: %v", err)
+	}
+	gw.RegisterRoutes(mux)
+	log.Printf("[Gateway Proxy] Initialized on :%s/v1 (Forwarding to %s, auto-offloading large files to /data)", *port, *lrmURL)
+
+	// Plan control & human-in-the-loop clarification endpoints
+	mux.HandleFunc("POST /api/v1/plans/{planID}/pause", func(w http.ResponseWriter, r *http.Request) {
+		replyCh := make(chan engine.CommandResult, 1)
+		eventCh <- engine.PausePlanCommand{PlanID: r.PathValue("planID"), ReplyCh: replyCh}
+		res := <-replyCh
+		w.Header().Set("Content-Type", "application/json")
+		if !res.Success {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		_ = json.NewEncoder(w).Encode(res)
+	})
+	mux.HandleFunc("POST /api/v1/plans/{planID}/resume", func(w http.ResponseWriter, r *http.Request) {
+		replyCh := make(chan engine.CommandResult, 1)
+		eventCh <- engine.ResumePlanCommand{PlanID: r.PathValue("planID"), ReplyCh: replyCh}
+		res := <-replyCh
+		w.Header().Set("Content-Type", "application/json")
+		if !res.Success {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		_ = json.NewEncoder(w).Encode(res)
+	})
+	mux.HandleFunc("POST /api/v1/plans/{planID}/tasks/{taskID}/clarify", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Answer string `json:"answer"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Answer == "" {
+			http.Error(w, "non-empty JSON {\"answer\": \"...\"} is required", http.StatusBadRequest)
+			return
+		}
+		planID, taskID := r.PathValue("planID"), r.PathValue("taskID")
+		qReply := make(chan engine.GetPlanResult, 1)
+		eventCh <- engine.GetPlanQuery{PlanID: planID, ReplyCh: qReply}
+		planRes := <-qReply
+		if !planRes.Found || planRes.Plan == nil {
+			http.Error(w, "plan not found", http.StatusNotFound)
+			return
+		}
+		var target *engine.TaskNode
+		for _, e := range planRes.Plan.Epics {
+			for _, s := range e.Stories {
+				for _, t := range s.Tasks {
+					if t.ID == taskID {
+						target = t
+					}
+				}
+			}
+		}
+		if target == nil {
+			http.Error(w, "task not found", http.StatusNotFound)
+			return
+		}
+		interp, err := lrm.InterpretClarification(r.Context(), llm.ClarificationInput{
+			Task: llm.TaskSpec{
+				ID:                 target.ID,
+				Title:              target.Title,
+				Description:        target.Description,
+				TaskType:           target.TaskType,
+				AcceptanceCriteria: target.AcceptanceCriteria,
+			},
+			Explanation: target.PendingExplanation,
+			Question:    target.PendingQuestion,
+			Answer:      body.Answer,
+			Feedback:    target.FeedbackHistory,
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		cReply := make(chan engine.CommandResult, 1)
+		eventCh <- engine.ClarificationResolvedEvent{
+			PlanID:         planID,
+			TaskID:         taskID,
+			Interpretation: interp,
+			Answer:         body.Answer,
+			ReplyCh:        cReply,
+		}
+		res := <-cReply
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(res)
+	})
 
 	// Worker fleet REST endpoints
 	mux.HandleFunc("GET /api/v1/workers", func(w http.ResponseWriter, r *http.Request) {

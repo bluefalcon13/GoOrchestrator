@@ -12,11 +12,12 @@ import (
 	"sync"
 	"time"
 
-	"go-orchestrator/engine"
 	"go-orchestrator/llm"
 )
 
-// MCPServer exposes the orchestrator's tools over the standard MCP SSE protocol for VS Code Continue.
+// MCPServer exposes the orchestrator's tools over the standard MCP SSE protocol
+// for VS Code extensions (Cline / Continue), delegating all execution to the
+// shared OrchestratorContext methods in tools.go.
 type MCPServer struct {
 	oCtx     OrchestratorContext
 	mu       sync.RWMutex
@@ -77,13 +78,11 @@ func (s *MCPServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// 1. Initial endpoint event required by MCP SSE spec
 	endpointURI := fmt.Sprintf("/mcp/messages?sessionId=%s", sessionID)
 	fmt.Fprintf(w, "event: endpoint\ndata: %s\n\n", endpointURI)
 	flusher.Flush()
 	log.Printf("[MCP] Session started: %s -> %s", sessionID, endpointURI)
 
-	// 2. Loop streaming outgoing JSON-RPC responses
 	for {
 		select {
 		case <-r.Context().Done():
@@ -128,21 +127,23 @@ func (s *MCPServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 
 	go func() {
-		resp := s.dispatch(req)
-		if resp != nil {
-			data, err := json.Marshal(resp)
-			if err == nil {
-				select {
-				case ch <- string(data):
-				case <-time.After(5 * time.Second):
-					log.Printf("[MCP] Timeout sending response to session %s", sessionID)
-				}
-			}
+		resp := s.dispatch(context.Background(), req)
+		if resp == nil {
+			return
+		}
+		data, err := json.Marshal(resp)
+		if err != nil {
+			return
+		}
+		select {
+		case ch <- string(data):
+		case <-time.After(5 * time.Second):
+			log.Printf("[MCP] Timeout sending response to session %s", sessionID)
 		}
 	}()
 }
 
-func (s *MCPServer) dispatch(req jsonRPCRequest) *jsonRPCResponse {
+func (s *MCPServer) dispatch(ctx context.Context, req jsonRPCRequest) *jsonRPCResponse {
 	switch req.Method {
 	case "initialize":
 		return &jsonRPCResponse{
@@ -150,46 +151,23 @@ func (s *MCPServer) dispatch(req jsonRPCRequest) *jsonRPCResponse {
 			ID:      req.ID,
 			Result: map[string]any{
 				"protocolVersion": "2024-11-05",
-				"capabilities": map[string]any{
-					"tools": map[string]any{},
-				},
-				"serverInfo": map[string]any{
-					"name":    "strix-orchestrator",
-					"version": "1.0.0",
-				},
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]any{"name": "strix-orchestrator", "version": "2.0.0"},
 			},
 		}
-
 	case "notifications/initialized":
 		return nil
-
 	case "ping":
-		return &jsonRPCResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result:  map[string]any{},
-		}
-
+		return &jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
 	case "tools/list":
-		return &jsonRPCResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result: map[string]any{
-				"tools": s.toolDefinitions(),
-			},
-		}
-
+		return &jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": s.toolDefinitions()}}
 	case "tools/call":
-		return s.handleToolCall(req)
-
+		return s.handleToolCall(ctx, req)
 	default:
 		return &jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
-			Error: map[string]any{
-				"code":    -32601,
-				"message": fmt.Sprintf("method %q not found", req.Method),
-			},
+			Error:   map[string]any{"code": -32601, "message": fmt.Sprintf("method %q not found", req.Method)},
 		}
 	}
 }
@@ -227,7 +205,7 @@ func (s *MCPServer) toolDefinitions() []map[string]any {
 														"id":          map[string]any{"type": "string", "description": "Unique task ID (REQUIRED), e.g. TASK_001"},
 														"title":       map[string]any{"type": "string", "description": "Task title"},
 														"description": map[string]any{"type": "string", "description": "Task description"},
-														"task_type":   map[string]any{"type": "string", "description": "Task type: code_gen, text_extract, rag_query, etc."},
+														"task_type":   map[string]any{"type": "string", "description": "Task type: code_gen, text_extract, rag_search, rag_index"},
 														"depends_on":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Prerequisite task IDs"},
 													},
 													"required": []string{"id", "title"},
@@ -258,7 +236,7 @@ func (s *MCPServer) toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "strix_orchestrator_get_execution_status",
-			"description": "Inspect live execution progress, NPU worker scores, and retries for an APPROVED, running plan. Requires approved plan_id.",
+			"description": "Inspect live execution progress, NPU worker scores, and retries for a plan.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -268,30 +246,39 @@ func (s *MCPServer) toolDefinitions() []map[string]any {
 			},
 		},
 		{
+			"name":        "strix_orchestrator_list_workers",
+			"description": "Inspect registered worker nodes (local NPU and remote GPUs like 9070XT), queue depth, and status.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
 			"name":        "strix_orchestrator_rag_search",
 			"description": "Search local documents, code, and logs using dense embeddings and cross-encoder reranking.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"query":      map[string]any{"type": "string", "description": "Search query"},
-					"collection": map[string]any{"type": "string", "description": "Qdrant collection name"},
-					"top_k":      map[string]any{"type": "integer", "description": "Number of results to return"},
+					"collection": map[string]any{"type": "string", "description": "Qdrant collection name (default: default_corpus)"},
+					"top_k":      map[string]any{"type": "integer", "description": "Number of results to return (default: 5)"},
 				},
 				"required": []string{"query"},
 			},
 		},
 		{
 			"name":        "strix_orchestrator_ingest_file",
-			"description": "Index a text document or log file into the local Qdrant vector database.",
+			"description": "Polymorphic RAG indexer: index a file from disk by file_path (e.g. '/data/game.log') or raw text by content into local Qdrant. For large logs and documents, pass file_path to stream line-by-line with zero memory and zero context window bloat.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"content":    map[string]any{"type": "string", "description": "Document or log contents to index"},
+					"file_path":  map[string]any{"type": "string", "description": "Local path to the file on disk (e.g. 'data/game.log', '/data/game.log')"},
+					"path":       map[string]any{"type": "string", "description": "Alias for file_path"},
+					"content":    map[string]any{"type": "string", "description": "Raw string content (optional; if omitted or pointing to a file, file_path is used)"},
 					"collection": map[string]any{"type": "string", "description": "Qdrant collection name (default: default_corpus)"},
-					"source":     map[string]any{"type": "string", "description": "File path or identifier"},
-					"chunk_size": map[string]any{"type": "integer", "description": "Token chunk size (default: 512)"},
+					"source":     map[string]any{"type": "string", "description": "Source identifier (default: file path or 'inline_upload')"},
+					"chunk_size": map[string]any{"type": "integer", "description": "Character chunk size (default: 1000)"},
 				},
-				"required": []string{"content"},
 			},
 		},
 	}
@@ -302,7 +289,7 @@ type toolCallParams struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
-func (s *MCPServer) handleToolCall(req jsonRPCRequest) *jsonRPCResponse {
+func (s *MCPServer) handleToolCall(ctx context.Context, req jsonRPCRequest) *jsonRPCResponse {
 	var params toolCallParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return &jsonRPCResponse{
@@ -312,8 +299,7 @@ func (s *MCPServer) handleToolCall(req jsonRPCRequest) *jsonRPCResponse {
 		}
 	}
 
-	name := strings.TrimPrefix(params.Name, "strix_orchestrator_")
-	name = strings.TrimPrefix(name, "orchestrator_")
+	name := normalizeMCPToolName(params.Name)
 	log.Printf("[MCP] Invoking tool %q (raw: %q) with args: %s", name, params.Name, string(params.Arguments))
 
 	var outputText string
@@ -321,140 +307,38 @@ func (s *MCPServer) handleToolCall(req jsonRPCRequest) *jsonRPCResponse {
 
 	switch name {
 	case "draft_plan":
-		planSpec, err := llm.ParsePlanSpec(string(params.Arguments))
-		if err != nil {
-			outputText = fmt.Sprintf("Error parsing draft_plan arguments: %v", err)
-			break
+		var planSpec llm.PlanSpec
+		planSpec, err = llm.ParsePlanSpec(string(params.Arguments))
+		if err == nil {
+			outputText, err = s.oCtx.ExecuteDraftPlan(ctx, planSpec)
 		}
-		if _, err := engine.ValidatePlanSpec(planSpec, nil); err != nil {
-			outputText = fmt.Sprintf("Plan validation failed: %v", err)
-			break
-		}
-		replyCh := make(chan engine.CommandResult, 1)
-		s.oCtx.EventCh <- engine.StoreDraftPlanCommand{Plan: planSpec, ReplyCh: replyCh}
-		cmdRes := <-replyCh
-		if !cmdRes.Success {
-			outputText = fmt.Sprintf("Failed to save draft: %s", cmdRes.Message)
-			break
-		}
-		planID := planSpec.ID
-		if strID, ok := cmdRes.Data.(string); ok && strID != "" {
-			planID = strID
-		} else if pSpec, ok := cmdRes.Data.(llm.PlanSpec); ok && pSpec.ID != "" {
-			planID = pSpec.ID
-		}
-		outputText = fmt.Sprintf("DRAFT PLAN CREATED (ID: %s)\nStatus: Draft (Awaiting User Approval)\nObjective: %s\n"+
-			"Instruct the user to review this plan. To execute, call approve_plan with plan_id: %q.",
-			planID, planSpec.Objective, planID)
 
 	case "approve_plan":
 		var in ApprovePlanArgs
-		if err := json.Unmarshal(params.Arguments, &in); err != nil {
-			outputText = fmt.Sprintf("Error parsing approve_plan arguments: %v", err)
-			break
+		if err = json.Unmarshal(params.Arguments, &in); err == nil {
+			outputText, err = s.oCtx.ExecuteApprovePlan(ctx, in)
 		}
-		planID := strings.TrimSpace(in.PlanID)
-		replyCh := make(chan engine.CommandResult, 1)
-		s.oCtx.EventCh <- engine.SeedPlanEvent{PlanID: planID, RawJSON: "", ReplyCh: replyCh}
-		cmdRes := <-replyCh
-		if !cmdRes.Success {
-			outputText = fmt.Sprintf("Approval failed: %s", cmdRes.Message)
-			break
-		}
-		outputText = fmt.Sprintf("Plan %s APPROVED and actively executing across Ryzen AI NPU. Monitor via get_execution_status.", planID)
 
 	case "get_execution_status", "get_plan_status":
 		var in GetPlanStatusArgs
-		if err := json.Unmarshal(params.Arguments, &in); err != nil {
-			outputText = fmt.Sprintf("Error parsing get_plan_status arguments: %v", err)
-			break
+		if err = json.Unmarshal(params.Arguments, &in); err == nil {
+			outputText, err = s.oCtx.ExecuteGetPlanStatus(ctx, in)
 		}
-		planID := strings.TrimSpace(in.PlanID)
-		replyCh := make(chan engine.GetPlanResult, 1)
-		s.oCtx.EventCh <- engine.GetPlanQuery{PlanID: planID, ReplyCh: replyCh}
-		res := <-replyCh
-		if !res.Found {
-			outputText = fmt.Sprintf("Plan %s not found.", planID)
-			break
-		}
-		outBytes, _ := json.MarshalIndent(res.Plan, "", "  ")
-		outputText = string(outBytes)
+
+	case "list_workers":
+		outputText, err = s.oCtx.ExecuteListWorkers()
 
 	case "rag_search":
 		var in RAGSearchArgs
-		if err := json.Unmarshal(params.Arguments, &in); err != nil {
-			outputText = fmt.Sprintf("Error parsing rag_search arguments: %v", err)
-			break
+		if err = json.Unmarshal(params.Arguments, &in); err == nil {
+			outputText, err = s.oCtx.ExecuteRAGSearch(ctx, in)
 		}
-		if s.oCtx.RAGClient == nil {
-			outputText = "RAG search client is not configured."
-			break
-		}
-		col := in.Collection
-		if col == "" {
-			col = "default_corpus"
-		}
-		limit := in.TopK
-		if limit <= 0 {
-			limit = 5
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		results, err := s.oCtx.RAGClient.SearchAndRerank(ctx, col, in.Query, limit*2, limit)
-		cancel()
-		if err != nil {
-			if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "doesn't exist") {
-				outputText = fmt.Sprintf("Collection %q not found or empty. You can ingest files using strix_orchestrator_ingest_file(collection=%q, content=...).", col, col)
-			} else {
-				outputText = fmt.Sprintf("Search error: %v", err)
-			}
-			break
-		}
-		if len(results) == 0 {
-			outputText = fmt.Sprintf("No relevant matches found in collection %q for query %q.", col, in.Query)
-			break
-		}
-		var sb strings.Builder
-		for i, r := range results {
-			fmt.Fprintf(&sb, "[%d] Score: %.3f | Source: %s\n%s\n\n", i+1, r.Score, r.Source, r.Text)
-		}
-		outputText = sb.String()
 
 	case "ingest_file", "index_text":
-		type IngestFileArgs struct {
-			Content    string `json:"content"`
-			Collection string `json:"collection"`
-			Source     string `json:"source"`
-			ChunkSize  int    `json:"chunk_size"`
-		}
 		var in IngestFileArgs
-		if err := json.Unmarshal(params.Arguments, &in); err != nil {
-			outputText = fmt.Sprintf("Error parsing ingest_file arguments: %v", err)
-			break
+		if err = json.Unmarshal(params.Arguments, &in); err == nil {
+			outputText, err = s.oCtx.ExecuteIngestFile(ctx, in)
 		}
-		if s.oCtx.RAGClient == nil {
-			outputText = "RAG client is not configured."
-			break
-		}
-		col := in.Collection
-		if col == "" {
-			col = "default_corpus"
-		}
-		src := in.Source
-		if src == "" {
-			src = "continue_upload"
-		}
-		cs := in.ChunkSize
-		if cs <= 0 {
-			cs = 512
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		numChunks, err := s.oCtx.RAGClient.IndexText(ctx, col, in.Content, src, cs)
-		cancel()
-		if err != nil {
-			outputText = fmt.Sprintf("Ingest error: %v", err)
-			break
-		}
-		outputText = fmt.Sprintf("Successfully indexed %d chunks from %s into collection %q.", numChunks, src, col)
 
 	default:
 		outputText = fmt.Sprintf("Unknown tool %q", name)
@@ -469,11 +353,19 @@ func (s *MCPServer) handleToolCall(req jsonRPCRequest) *jsonRPCResponse {
 		ID:      req.ID,
 		Result: map[string]any{
 			"content": []map[string]any{
-				{
-					"type": "text",
-					"text": outputText,
-				},
+				{"type": "text", "text": outputText},
 			},
 		},
 	}
+}
+
+func normalizeMCPToolName(raw string) string {
+	// Handles Cline (go-orchestrator__strix_orchestrator_ingest_file), Continue (strix_orchestrator_ingest_file), etc.
+	if idx := strings.Index(raw, "strix_orchestrator_"); idx != -1 {
+		return raw[idx+len("strix_orchestrator_"):]
+	}
+	if idx := strings.Index(raw, "orchestrator_"); idx != -1 {
+		return raw[idx+len("orchestrator_"):]
+	}
+	return raw
 }

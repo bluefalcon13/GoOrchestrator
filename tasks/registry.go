@@ -3,6 +3,7 @@ package tasks
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 )
 
@@ -52,12 +53,42 @@ func (r *Registry) Register(taskType string, handler TaskHandler) {
 	r.handlers[taskType] = handler
 }
 
-// Get returns the handler registered for taskType, or false if not found.
+// Get returns the handler registered for taskType, or falls back to semantic matching and default handler.
 func (r *Registry) Get(taskType string) (TaskHandler, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	h, ok := r.handlers[taskType]
-	return h, ok
+	if ok {
+		return h, true
+	}
+
+	norm := strings.ToLower(strings.TrimSpace(taskType))
+	if h, ok := r.handlers[norm]; ok {
+		return h, true
+	}
+
+	if strings.Contains(norm, "ingest") || strings.Contains(norm, "index") {
+		if h, ok := r.handlers["rag_index"]; ok {
+			return h, true
+		}
+	}
+	if strings.Contains(norm, "rag") || strings.Contains(norm, "search") || strings.Contains(norm, "query") {
+		if h, ok := r.handlers["rag_search"]; ok {
+			return h, true
+		}
+	}
+	if strings.Contains(norm, "extract") || strings.Contains(norm, "text") || strings.Contains(norm, "grep") ||
+		strings.Contains(norm, "verif") || strings.Contains(norm, "valid") || strings.Contains(norm, "report") {
+		if h, ok := r.handlers["text_extract"]; ok {
+			return h, true
+		}
+	}
+
+	// Default fallback to code_gen (general worker execution)
+	if h, ok := r.handlers["code_gen"]; ok {
+		return h, true
+	}
+	return nil, false
 }
 
 // List returns a list of registered task type names.

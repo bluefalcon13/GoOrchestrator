@@ -15,6 +15,7 @@ Your capabilities:
 2. To check active execution progress or task outputs, call 'get_plan_status'.
 3. To inspect registered hardware workers (local NPU, remote 9070XT), call 'list_workers'.
 4. To search local logs, code, or documents, call 'rag_search'.
+5. To index a large file from disk or inline text into Qdrant, call 'ingest_file'.
 
 Always be concise, precise, and professional. If the user invokes classic sci-fi easter eggs (e.g., 'Execute Order 66'), acknowledge them with witty in-universe flavor while fulfilling the request.`
 

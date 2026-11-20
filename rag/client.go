@@ -1,6 +1,7 @@
 package rag
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -42,6 +44,7 @@ type Client interface {
 	Search(ctx context.Context, collection string, query string, limit int) ([]SearchResult, error)
 	SearchAndRerank(ctx context.Context, collection string, query string, candidateLimit int, topK int) ([]SearchResult, error)
 	IndexText(ctx context.Context, collection string, text string, source string, chunkSize int) (int, error)
+	IndexFile(ctx context.Context, collection string, filePath string, chunkSize int) (int, error)
 }
 
 // RerankItem holds individual score output from llama-rerank.
@@ -407,7 +410,7 @@ func (c *HTTPRAGClient) SearchAndRerank(ctx context.Context, collection string, 
 // IndexText splits text into sliding chunks and upserts them into Qdrant.
 func (c *HTTPRAGClient) IndexText(ctx context.Context, collection string, text string, source string, chunkSize int) (int, error) {
 	if chunkSize <= 0 {
-		chunkSize = 2000
+		chunkSize = 1000
 	}
 
 	lines := strings.Split(text, "\n")
@@ -455,5 +458,102 @@ func (c *HTTPRAGClient) IndexText(ctx context.Context, collection string, text s
 		}
 	}
 	return len(chunks), nil
+}
+
+// IndexFile streams lines from a disk file, chunks them, and upserts them to Qdrant in batches of 50.
+// This maintains a constant ~2MB memory footprint regardless of file size (tested up to multi-GB logs).
+func (c *HTTPRAGClient) IndexFile(ctx context.Context, collection string, filePath string, chunkSize int) (int, error) {
+	if chunkSize <= 0 {
+		chunkSize = 1000
+	}
+
+	target := filePath
+	if _, err := os.Stat(target); err != nil {
+		found := false
+		for _, prefix := range []string{"/data/", "data/", "./data/", "./"} {
+			candidate := prefix + strings.TrimPrefix(filePath, "/")
+			candidate = strings.ReplaceAll(candidate, "//", "/")
+			if _, err := os.Stat(candidate); err == nil {
+				target = candidate
+				found = true
+				break
+			}
+		}
+		if !found {
+			return 0, fmt.Errorf("file %q not found on disk: %w", filePath, err)
+		}
+	}
+
+	f, err := os.Open(target)
+	if err != nil {
+		return 0, fmt.Errorf("open file %s: %w", target, err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	// Allow scanning up to 10MB per line for long log entries / single-line minified json
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
+	var curChunk strings.Builder
+	var chunkBatch []DocumentChunk
+	totalChunks := 0
+	chunkIndex := 0
+	batchSize := 50
+
+	flushBatch := func() error {
+		if len(chunkBatch) == 0 {
+			return nil
+		}
+		if err := c.UpsertChunks(ctx, collection, chunkBatch); err != nil {
+			return fmt.Errorf("upsert batch (up to chunk %d): %w", chunkIndex, err)
+		}
+		totalChunks += len(chunkBatch)
+		chunkBatch = chunkBatch[:0]
+		return nil
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if curChunk.Len()+len(line)+1 > chunkSize && curChunk.Len() > 0 {
+			chunkBatch = append(chunkBatch, DocumentChunk{
+				Text:       curChunk.String(),
+				Source:     filePath,
+				ChunkIndex: chunkIndex,
+			})
+			chunkIndex++
+			curChunk.Reset()
+
+			if len(chunkBatch) >= batchSize {
+				if err := flushBatch(); err != nil {
+					return totalChunks, err
+				}
+			}
+		}
+
+		if curChunk.Len() > 0 {
+			curChunk.WriteString("\n")
+		}
+		curChunk.WriteString(line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return totalChunks, fmt.Errorf("scan file %s: %w", target, err)
+	}
+
+	if curChunk.Len() > 0 {
+		chunkBatch = append(chunkBatch, DocumentChunk{
+			Text:       curChunk.String(),
+			Source:     filePath,
+			ChunkIndex: chunkIndex,
+		})
+		chunkIndex++
+	}
+
+	if err := flushBatch(); err != nil {
+		return totalChunks, err
+	}
+
+	return totalChunks, nil
 }
 

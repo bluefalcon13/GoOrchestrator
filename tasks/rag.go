@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 
 	"go-orchestrator/rag"
 )
@@ -65,7 +67,30 @@ func (h *RAGIndexHandler) Execute(ctx context.Context, input TaskInput) (TaskOut
 
 	chunkSize := params.ChunkSize
 	if chunkSize <= 0 {
-		chunkSize = 2000
+		chunkSize = 1000
+	}
+
+	// Polymorphic check: if doc is a file path on disk, stream directly using IndexFile
+	if len(doc) < 500 && strings.Contains(doc, ".") {
+		for _, prefix := range []string{"", "/data/", "data/", "./data/", "./"} {
+			target := prefix + strings.TrimPrefix(strings.TrimSpace(doc), "/")
+			if _, err := os.Stat(target); err == nil {
+				chunksIndexed, err := h.ragClient.IndexFile(ctx, collection, target, chunkSize)
+				if err != nil {
+					return TaskOutput{}, fmt.Errorf("failed to stream index file %s: %w", target, err)
+				}
+				res := map[string]interface{}{
+					"status":         "indexed_file_stream",
+					"collection":     collection,
+					"source":         target,
+					"chunks_indexed": chunksIndexed,
+				}
+				outBytes, _ := json.MarshalIndent(res, "", "  ")
+				return TaskOutput{
+					Content: string(outBytes),
+				}, nil
+			}
+		}
 	}
 
 	chunksIndexed, err := h.ragClient.IndexText(ctx, collection, doc, source, chunkSize)

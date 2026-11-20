@@ -136,5 +136,41 @@ func TestWorkerRouter_CompleteTransparentRouting(t *testing.T) {
 	if !strings.Contains(resp.Content, "mock") && resp.Content == "" {
 		t.Errorf("expected non-empty completion response")
 	}
+
+	workers := router.ListWorkers()
+	if len(workers) != 1 || workers[0].TotalTokens <= 0 {
+		t.Errorf("expected TotalTokens > 0 after completion, got %+v", workers)
+	}
+}
+
+func TestWorkerRouter_BusyNPUSpillsOverToIdleGPU(t *testing.T) {
+	router := NewWorkerRouter(llm.ModeMock)
+	_ = router.RegisterWorker(WorkerNode{
+		ID:          "npu-local",
+		Type:        "npu",
+		MaxContext:  8192,
+		Concurrency: 1,
+	})
+	_ = router.RegisterWorker(WorkerNode{
+		ID:          "desktop-9070xt",
+		Type:        "gpu",
+		MaxContext:  32768,
+		Concurrency: 4,
+	})
+
+	// First small request claims the NPU (concurrency=1 -> now busy)
+	first, err := router.SelectWorker(500)
+	if err != nil || first.ID != "npu-local" {
+		t.Fatalf("expected first request on npu-local, got %v (err=%v)", first, err)
+	}
+
+	// Second concurrent small request should spill over to idle GPU instead of piling onto busy NPU
+	second, err := router.SelectWorker(500)
+	if err != nil || second.ID != "desktop-9070xt" {
+		t.Fatalf("expected second concurrent request to spill over to desktop-9070xt, got %v (err=%v)", second, err)
+	}
+
+	router.releaseWorker(first.ID)
+	router.releaseWorker(second.ID)
 }
 
